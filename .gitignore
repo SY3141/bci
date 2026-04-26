@@ -1,0 +1,19 @@
+# bci subject data cache
+processed_data/
+mne_data/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# VS Code / Environments
+.vscode/
+.dist/
+.env
+venv/
+env/
+
