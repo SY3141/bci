@@ -21,7 +21,7 @@ class EEGCacheDataset(Dataset):
         self.cache_files = cache_files[:num_subjects]
         self.encoder = LabelEncoder()
 
-        print(f"Loading {len(self.cache_files)} subjects from local cache...")
+        print(f"Loading {len(self.cache_files)} subjects from {self.data_dir}...")
         X_list, y_list = [], []
 
         for i, file_path in enumerate(self.cache_files):
