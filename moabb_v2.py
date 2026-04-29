@@ -200,6 +200,10 @@ for file_path in cache_files:
         
         # Original shape: (Epochs, Channels, Timepoints)
         original_timepoints = X_sub.shape[2]
+
+        if original_timepoints < 400:
+            print(f"Subject {subject_num}: Skipping downsampling because it has only {original_timepoints} timepoints.")
+            continue
         
         # Downsample by taking every Nth element along the timepoints axis
         X_sub = X_sub[:, :, ::downsample_ratio]
