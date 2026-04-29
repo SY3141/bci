@@ -1,0 +1,262 @@
+Methodology
+
+This project trains a transformer-based classifier on motor-imagery EEG data from the MOABB Cho2017 dataset. The workflow is split into two modules:
+
+- moabb_data.py prepares and caches the EEG data.
+- moabb_train.py loads the prepared tensors, builds the model, trains it, and evaluates it.
+
+Data Pipeline
+
+1. Dataset source
+
+The data source is the Cho2017 motor imagery dataset from MOABB. The paradigm is configured as:
+
+- Dataset: Cho2017
+- Paradigm: MotorImagery
+- Frequency band: 8-32 Hz
+- Original sampling frequency assumption: 512 Hz
+- Classes: left_hand and right_hand
+
+The 8-32 Hz band targets the mu and beta rhythms commonly used in motor imagery decoding.
+
+2. Download and local caching
+
+moabb_data.py configures MNE and MOABB to use the local mne_data directory. It then iterates through the Cho2017 subject list and downloads each missing subject individually.
+
+For each subject, MOABB returns:
+
+- X_sub: EEG epochs with shape (epochs, channels, timepoints)
+- y_sub: class labels for each epoch
+
+Each subject is saved as a PyTorch file:
+
+processed_data/subject_<id>.pt
+
+The saved file contains a tuple:
+
+(X_sub, y_sub)
+
+This avoids repeatedly downloading and re-extracting the raw MOABB data.
+
+3. Subject inspection
+
+After downloading, subject 1 is inspected. The script prints:
+
+- Python types for EEG data and labels
+- Tensor shape
+- Number of epochs
+- Number of channels
+- Number of timepoints
+- Label counts per class
+
+This is a quick sanity check that the cache contains the expected binary motor-imagery labels.
+
+4. Epoch truncation
+
+Each cached subject is limited to a maximum of 200 epochs:
+
+- If a subject has more than 200 epochs, only the first 200 are kept.
+- If a subject has fewer than 200 epochs, the script reports that count.
+
+This creates a more uniform per-subject tensor shape before combining subjects.
+
+5. Downsampling
+
+The cached EEG tensors are downsampled along the time axis by taking every 5th sample:
+
+X_sub = X_sub[:, :, ::5]
+
+This reduces the temporal length and makes transformer training cheaper. The code includes a guard to avoid repeatedly shrinking already-downsampled data:
+
+- If a subject has fewer than 400 timepoints, downsampling is skipped.
+- Otherwise, the subject is downsampled and saved back to processed_data.
+
+With the Cho2017 sampling assumption, the effective sampling frequency after downsampling is:
+
+512 / 5 = 102.4 Hz
+
+6. PyGEDAI preprocessing
+
+The data module always applies pygedai preprocessing after download, truncation, and downsampling:
+
+python moabb_data.py
+
+For each epoch, the script calls pygedai's GEDAI cleaning function with:
+
+- epoch_data shaped as (channels, timepoints)
+- sfreq = 102.4 Hz
+- dummy leadfield = identity matrix with shape (channels, channels)
+
+The cleaned output is extracted from:
+
+out["cleaned"]
+
+Cleaned subject tensors are saved to:
+
+pygedai_processed/subject_<id>.pt
+
+The training module always reads from pygedai_processed, so moabb_data.py must be run before training.
+
+Training Data Loading
+
+moabb_train.py loads all available subject files from pygedai_processed by default. It uses up to 52 subjects:
+
+- Files are sorted numerically by subject id.
+- EEG tensors from all selected subjects are concatenated along the epoch dimension.
+- Labels are concatenated and encoded with sklearn.preprocessing.LabelEncoder.
+- The final input tensor is converted to float32 and reshaped to:
+
+(trials, 1, channels, timepoints)
+
+The extra dimension is a convolution input channel dimension used by the CNN front-end.
+
+Dataset Split
+
+The combined dataset is split randomly with a fixed seed of 42:
+
+- 70% training
+- 20% validation
+- 10% testing
+
+The validation set is used during training to monitor performance. The test set is held out until the final model evaluation after training.
+
+Mini-batch DataLoaders are created with:
+
+- train_loader: shuffled
+- val_loader: not shuffled
+- test_loader: not shuffled
+- default batch size: 32
+
+Model Architecture
+
+The model is EEGTransformer, a CNN plus transformer encoder classifier.
+
+1. Input
+
+The model receives EEG batches shaped:
+
+(batch, 1, channels, timepoints)
+
+2. CNN front-end
+
+The convolution block extracts local temporal and spatial EEG features before the transformer:
+
+- Temporal convolution:
+  Conv2d(1, 40, kernel_size=(1, 25), padding=(0, 12))
+
+- Spatial convolution across all EEG channels:
+  Conv2d(40, 40, kernel_size=(n_channels, 1), bias=False)
+
+- Batch normalization:
+  BatchNorm2d(40)
+
+- Nonlinearity:
+  ELU
+
+- Temporal pooling:
+  AvgPool2d(kernel_size=(1, 15), stride=(1, 15))
+
+- Regularization:
+  Dropout(0.5)
+
+After this block, the tensor has 40 learned feature channels and a reduced temporal sequence length.
+
+3. Sequence tokenization
+
+The CNN output is reshaped from convolution format into transformer sequence format:
+
+(batch, sequence_length, 40)
+
+Each pooled time segment becomes one transformer token with 40 features.
+
+4. Token projection
+
+A linear projection maps each 40-dimensional CNN token to the transformer embedding dimension:
+
+Linear(40, d_model)
+
+The default d_model is 64.
+
+5. CLS token
+
+A learned classification token is prepended to each sequence. After transformer encoding, the final CLS token state is used as the summary representation for classification.
+
+6. Positional embedding
+
+A learned positional embedding is added to the full sequence, including the CLS token. This gives the transformer information about token order over time.
+
+7. Transformer encoder
+
+The transformer encoder uses:
+
+- d_model = 64
+- n_heads = 8
+- n_layers = 4
+- feedforward dimension = 256
+- dropout = 0.3
+- batch_first = True
+
+This allows the model to learn temporal dependencies between the pooled EEG feature tokens.
+
+8. Classification head
+
+The final CLS token embedding is passed through:
+
+- LayerNorm(d_model)
+- Linear(d_model, n_classes)
+
+For Cho2017 motor imagery, n_classes is usually 2: left_hand and right_hand.
+
+Training Procedure
+
+Training uses:
+
+- Loss: CrossEntropyLoss
+- Optimizer: AdamW
+- Learning rate: 0.001
+- Weight decay: 1e-4
+- Scheduler: CosineAnnealingLR
+- Default epochs: 50
+
+During each epoch:
+
+1. The model is set to train mode.
+2. Each training batch is moved to GPU if available, otherwise CPU.
+3. Forward pass produces class logits.
+4. Cross-entropy loss is computed.
+5. Gradients are backpropagated.
+6. AdamW updates the weights.
+7. The cosine scheduler steps once per epoch.
+
+Every 10 epochs, validation accuracy is computed on the fixed validation set.
+
+Final Evaluation
+
+After training, the model is evaluated once on the held-out test set. The script reports:
+
+Final Test Accuracy
+
+This is the least-biased metric in the current pipeline because the test set is not used for training progress checks.
+
+Scaling-Law Experiment
+
+Unless --skip-scaling is passed, the training script also runs a scaling experiment. It trains fresh models on increasing fractions of the training set:
+
+- 10%
+- 20%
+- 40%
+- 60%
+- 80%
+- 100%
+
+Each model is evaluated on the same fixed validation set. The resulting validation accuracies are plotted against the number of training samples and saved as:
+
+scaling_law.png
+
+Important Implementation Notes
+
+- moabb_train.py always loads from pygedai_processed.
+- Run moabb_data.py before training.
+- The downsampling step is destructive for processed_data files, but it skips tensors below 400 timepoints to avoid repeated shrinking.
+- The train/validation/test split is trial-level, not subject-level. This means trials from the same subject can appear in different splits.
+- The model currently does not apply explicit train-set-only normalization before training.

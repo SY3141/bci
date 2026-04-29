@@ -33,7 +33,7 @@ class EEGCacheDataset(Dataset):
         print(f"\nSuccessfully loaded {len(self.cache_files)} subjects.")
 
         if not X_list:
-            raise ValueError(f"No subject_*.pt files found in {self.data_dir}. Run moabb_data.py --apply-pygedai first.")
+            raise ValueError(f"No subject_*.pt files found in {self.data_dir}. Run moabb_data.py first.")
 
         X_combined = np.concatenate(X_list, axis=0)
         y_combined = np.array(y_list)

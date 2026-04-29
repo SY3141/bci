@@ -257,15 +257,12 @@ def prepare_data(
     max_epochs=200,
     downsample_ratio=5,
     min_timepoints=400,
-    apply_pygedai=False,
-    pygedai_output_dir=PYGEDAI_DATA_DIR,
 ):
     download_subjects(data_dir=data_dir, mne_data_dir=mne_data_dir)
     inspect_subject(subject=1, data_dir=data_dir)
     truncate_subjects(data_dir=data_dir, max_epochs=max_epochs)
     downsample_subjects(data_dir=data_dir, downsample_ratio=downsample_ratio, min_timepoints=min_timepoints)
-    if apply_pygedai:
-        apply_pygedai_preprocessing(data_dir=data_dir, output_dir=pygedai_output_dir)
+    apply_pygedai_preprocessing(data_dir=data_dir, output_dir=PYGEDAI_DATA_DIR)
 
 
 def main():
@@ -275,8 +272,6 @@ def main():
     parser.add_argument("--max-epochs", type=int, default=200)
     parser.add_argument("--downsample-ratio", type=int, default=5)
     parser.add_argument("--min-timepoints", type=int, default=400)
-    parser.add_argument("--apply-pygedai", action="store_true")
-    parser.add_argument("--pygedai-output-dir", default=PYGEDAI_DATA_DIR)
     args = parser.parse_args()
 
     prepare_data(
@@ -285,8 +280,6 @@ def main():
         max_epochs=args.max_epochs,
         downsample_ratio=args.downsample_ratio,
         min_timepoints=args.min_timepoints,
-        apply_pygedai=args.apply_pygedai,
-        pygedai_output_dir=args.pygedai_output_dir,
     )
 
 
