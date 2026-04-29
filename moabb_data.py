@@ -211,14 +211,86 @@ def _load_gedai():
             return None
 
 
+def _load_interpolate_ref_cov():
+    try:
+        from pygedai import interpolate_ref_cov
+
+        return interpolate_ref_cov
+    except (ImportError, AttributeError):
+        try:
+            from pygedai.ref_cov import interpolate_ref_cov
+
+            return interpolate_ref_cov
+        except (ImportError, AttributeError):
+            return None
+
+
+def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.float32):
+    configure_moabb(mne_data_dir=mne_data_dir)
+
+    import mne
+    import pandas as pd
+    from moabb.datasets import Cho2017
+
+    interpolate_ref_cov = _load_interpolate_ref_cov()
+    if interpolate_ref_cov is None:
+        raise ImportError("Could not import pygedai.interpolate_ref_cov.")
+
+    dataset = Cho2017()
+    raw = dataset.get_data(subjects=[1])[1]["session_0"]["run_0"]
+    eeg_picks = mne.pick_types(raw.info, eeg=True)
+    ch_names = [raw.ch_names[i] for i in eeg_picks]
+
+    montage = mne.channels.make_standard_montage("standard_1005")
+    positions = montage.get_positions()["ch_pos"]
+    position_lookup = {name.lower(): xyz for name, xyz in positions.items()}
+
+    rows = []
+    missing_channels = []
+    for ch_name in ch_names:
+        if ch_name in positions:
+            xyz = positions[ch_name]
+            rows.append({"channel_name": ch_name, "X": xyz[0], "Y": xyz[1], "Z": xyz[2]})
+        elif ch_name.lower() in position_lookup:
+            xyz = position_lookup[ch_name.lower()]
+            rows.append({"channel_name": ch_name, "X": xyz[0], "Y": xyz[1], "Z": xyz[2]})
+        else:
+            missing_channels.append(ch_name)
+
+    if missing_channels:
+        print(f"Warning: Coordinates not found in standard_1005 for: {missing_channels}")
+
+    if not rows:
+        raise ValueError("No Cho2017 EEG channels could be matched to standard_1005 coordinates.")
+
+    electrode_positions = pd.DataFrame(rows, columns=["channel_name", "X", "Y", "Z"])
+    print("Interpolating PyGEDAI reference covariance from Cho2017 standard_1005 channel coordinates...")
+    reference_covariance = interpolate_ref_cov(electrode_positions, dtype=dtype)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    reference_covariance = reference_covariance.to(device)
+    print(f"PyGEDAI reference covariance shape: {tuple(reference_covariance.shape)} on {device}")
+    return reference_covariance, device
+
+
 def apply_pygedai_preprocessing(
     data_dir=PROCESSED_DATA_DIR,
     output_dir=PYGEDAI_DATA_DIR,
     sfreq=CHO2017_SFREQ / 5,
+    mne_data_dir=MNE_DATA_DIR,
 ):
     run_gedai = _load_gedai()
     if run_gedai is None:
         print("Skipping pygedai preprocessing: could not import pygedai.gedai.")
+        return
+
+    try:
+        reference_covariance, device = build_cho2017_reference_covariance(
+            mne_data_dir=mne_data_dir,
+            dtype=torch.float32,
+        )
+    except Exception as exc:
+        print(f"Skipping pygedai preprocessing: could not build Cho2017 reference covariance. e={exc}")
         return
 
     output_path = Path(output_dir)
@@ -234,15 +306,26 @@ def apply_pygedai_preprocessing(
 
             cleaned_epochs = []
             n_channels = X_sub.shape[1]
-            dummy_leadfield = torch.eye(n_channels, dtype=torch.float32)
+            if reference_covariance.shape != (n_channels, n_channels):
+                raise ValueError(
+                    f"Reference covariance shape {tuple(reference_covariance.shape)} does not match "
+                    f"subject tensor channel count {n_channels}."
+                )
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 for epoch_data in X_sub:
-                    out = run_gedai(epoch_data, sfreq=sfreq, leadfield=dummy_leadfield)
+                    out = run_gedai(
+                        epoch_data,
+                        sfreq=sfreq,
+                        leadfield=reference_covariance,
+                        device=device,
+                        dtype=torch.float32,
+                    )
                     cleaned_data = out["cleaned"]
                     if not isinstance(cleaned_data, torch.Tensor):
                         cleaned_data = torch.tensor(cleaned_data, dtype=torch.float32)
+                    cleaned_data = cleaned_data.cpu()
                     cleaned_epochs.append(cleaned_data)
 
             torch.save((torch.stack(cleaned_epochs), y_sub), output_path / file_path.name)
@@ -262,7 +345,7 @@ def prepare_data(
     inspect_subject(subject=1, data_dir=data_dir)
     truncate_subjects(data_dir=data_dir, max_epochs=max_epochs)
     downsample_subjects(data_dir=data_dir, downsample_ratio=downsample_ratio, min_timepoints=min_timepoints)
-    apply_pygedai_preprocessing(data_dir=data_dir, output_dir=PYGEDAI_DATA_DIR)
+    apply_pygedai_preprocessing(data_dir=data_dir, output_dir=PYGEDAI_DATA_DIR, mne_data_dir=mne_data_dir)
 
 
 def main():

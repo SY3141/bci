@@ -2,6 +2,7 @@ matplotlib
 mne
 moabb
 numpy
+pandas
 pooch
 pygedai
 scikit-learn

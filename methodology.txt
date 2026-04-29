@@ -81,11 +81,22 @@ The data module always applies pygedai preprocessing after download, truncation,
 
 python moabb_data.py
 
+Before cleaning epochs, the script builds a PyGEDAI reference covariance from Cho2017 channel locations:
+
+- It fetches subject 1, session_0, run_0 from Cho2017 to get the exact EEG channel names.
+- It loads MNE's standard_1005 montage.
+- It maps each Cho2017 channel name to its standard_1005 X, Y, Z coordinate.
+- It creates a pandas DataFrame with channel_name, X, Y, and Z columns.
+- It passes that DataFrame to pygedai.interpolate_ref_cov.
+- The resulting reference covariance tensor is moved to CUDA when a GPU is available, otherwise CPU.
+
+This replaces the earlier placeholder identity matrix. The reference covariance rows are built in the same order as the Cho2017 EEG channel names, so row 0 in the covariance corresponds to row 0 in the EEG epoch tensor.
+
 For each epoch, the script calls pygedai's GEDAI cleaning function with:
 
 - epoch_data shaped as (channels, timepoints)
 - sfreq = 102.4 Hz
-- dummy leadfield = identity matrix with shape (channels, channels)
+- leadfield = the interpolated reference covariance from standard_1005 channel coordinates
 
 The cleaned output is extracted from:
 
