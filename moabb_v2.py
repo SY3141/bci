@@ -217,9 +217,16 @@ print("Downsampling complete.")
 import torch
 from pathlib import Path
 import numpy as np
-import pygedai
 import warnings
 import os
+
+try:
+    from pygedai import gedai as run_gedai
+except (ImportError, AttributeError):
+    try:
+        from pygedai.GEDAI import gedai as run_gedai
+    except (ImportError, AttributeError):
+        run_gedai = None
 
 data_dir = Path("processed_data")
 cache_files = sorted(
@@ -231,61 +238,64 @@ cache_files = sorted(
 SFREQ = 512 / 5
 
 # Create a separate output directory to save pygedai processed data
-output_dir = Path("pygedai")
+output_dir = Path("pygedai_processed")
 output_dir.mkdir(exist_ok=True)
 
-print("Applying pygedai preprocessing to subjects...")
-for file_path in cache_files:
-    subject_num = int(file_path.stem.split("_")[-1])
-    try:
-        # Load the data
-        X_sub, y_sub = torch.load(file_path, weights_only=False)
-        
-        # Make sure inputs are PyTorch tensors, as pygedai is internally calling .to()
-        if not isinstance(X_sub, torch.Tensor):
-            X_sub = torch.tensor(X_sub, dtype=torch.float32)
-            
-        X_sub_preprocessed = []
-        
-        # Provide a dummy identity matrix (treating each channel natively as its own source)
-        # Ensure it is also a PyTorch tensor.
-        n_channels = X_sub.shape[1] 
-        dummy_leadfield = torch.eye(n_channels, dtype=torch.float32)
-        
+if run_gedai is None:
+    print("Skipping pygedai preprocessing: could not import pygedai.gedai from the active Python environment.")
+else:
+    print("Applying pygedai preprocessing to subjects...")
+    for file_path in cache_files:
+        subject_num = int(file_path.stem.split("_")[-1])
         try:
-            # Suppress length warnings for cleaner output
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
+            # Load the data
+            X_sub, y_sub = torch.load(file_path, weights_only=False)
+            
+            # Make sure inputs are PyTorch tensors, as pygedai is internally calling .to()
+            if not isinstance(X_sub, torch.Tensor):
+                X_sub = torch.tensor(X_sub, dtype=torch.float32)
                 
-                for epoch_data in X_sub:
-                    # epoch_data is a PyTorch tensor of shape (Channels x Timepoints)
-                    out = pygedai.gedai(
-                        epoch_data, 
-                        sfreq=SFREQ, 
-                        leadfield=dummy_leadfield
-                    )
+            X_sub_preprocessed = []
+            
+            # Provide a dummy identity matrix (treating each channel natively as its own source)
+            # Ensure it is also a PyTorch tensor.
+            n_channels = X_sub.shape[1] 
+            dummy_leadfield = torch.eye(n_channels, dtype=torch.float32)
+            
+            try:
+                # Suppress length warnings for cleaner output
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
                     
-                    # pygedai returns a dict, extract the 'cleaned' tensor
-                    cleaned_data = out['cleaned']
-                    if not isinstance(cleaned_data, torch.Tensor):
-                        cleaned_data = torch.tensor(cleaned_data, dtype=torch.float32)
-                    X_sub_preprocessed.append(cleaned_data)
+                    for epoch_data in X_sub:
+                        # epoch_data is a PyTorch tensor of shape (Channels x Timepoints)
+                        out = run_gedai(
+                            epoch_data, 
+                            sfreq=SFREQ, 
+                            leadfield=dummy_leadfield
+                        )
+                        
+                        # pygedai returns a dict, extract the 'cleaned' tensor
+                        cleaned_data = out['cleaned']
+                        if not isinstance(cleaned_data, torch.Tensor):
+                            cleaned_data = torch.tensor(cleaned_data, dtype=torch.float32)
+                        X_sub_preprocessed.append(cleaned_data)
+                    
+                # Stack back into a single tensor
+                X_sub_tensor = torch.stack(X_sub_preprocessed)
                 
-            # Stack back into a single tensor
-            X_sub_tensor = torch.stack(X_sub_preprocessed)
+            except Exception as e2:
+                print(f"Could not apply pygedai formatting for Subject {subject_num}. e={e2}")
+                continue
+                
+            # Convert back to PyTorch tensor and save in the new directory
+            out_file_path = output_dir / file_path.name
+            torch.save((X_sub_tensor, y_sub), out_file_path)
             
-        except Exception as e2:
-            print(f"Could not apply pygedai formatting for Subject {subject_num}. e={e2}")
-            continue
+            print(f"Subject {subject_num}: Pygedai preprocessing applied and saved to {out_file_path}.")
             
-        # Convert back to PyTorch tensor and save in the new directory
-        out_file_path = output_dir / file_path.name
-        torch.save((X_sub_tensor, y_sub), out_file_path)
-        
-        print(f"Subject {subject_num}: Pygedai preprocessing applied and saved to {out_file_path}.")
-        
-    except Exception as e:
-        print(f"Error loading or saving Subject {subject_num}: {e}")
+        except Exception as e:
+            print(f"Error loading or saving Subject {subject_num}: {e}")
 
 # %%
 import torch
