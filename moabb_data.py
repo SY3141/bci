@@ -237,7 +237,11 @@ def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.fl
         raise ImportError("Could not import pygedai.interpolate_ref_cov.")
 
     dataset = Cho2017()
-    raw = dataset.get_data(subjects=[1])[1]["session_0"]["run_0"]
+    subject_data = dataset.get_data(subjects=[1])[1]
+    session_key = next(iter(subject_data))
+    run_key = next(iter(subject_data[session_key]))
+    print(f"Using Cho2017 subject 1, session '{session_key}', run '{run_key}' for channel names.")
+    raw = subject_data[session_key][run_key]
     eeg_picks = mne.pick_types(raw.info, eeg=True)
     ch_names = [raw.ch_names[i] for i in eeg_picks]
 

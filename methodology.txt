@@ -83,7 +83,7 @@ python moabb_data.py
 
 Before cleaning epochs, the script builds a PyGEDAI reference covariance from Cho2017 channel locations:
 
-- It fetches subject 1, session_0, run_0 from Cho2017 to get the exact EEG channel names.
+- It fetches the first available run from Cho2017 subject 1 to get the exact EEG channel names.
 - It loads MNE's standard_1005 montage.
 - It maps each Cho2017 channel name to its standard_1005 X, Y, Z coordinate.
 - It creates a pandas DataFrame with channel_name, X, Y, and Z columns.
