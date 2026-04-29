@@ -1,6 +1,7 @@
 # bci subject data cache
 processed_data/
 mne_data/
+pygedai_process/
 
 # Python caches
 __pycache__/
