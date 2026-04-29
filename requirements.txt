@@ -1,6 +1,9 @@
+matplotlib
+mne
+moabb
 numpy
+pooch
+pygedai
+scikit-learn
 torch
 urllib3
-moabb
-mne
-pooch
