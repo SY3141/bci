@@ -6,7 +6,7 @@ import torch
 
 INPUT_DATA_DIR = "pygedai_processed"
 OUTPUT_DATA_DIR = "spectrogram_data"
-DEFAULT_SFREQ = 512 / 5
+DEFAULT_SFREQ = 512 / 4
 
 
 def get_cache_files(data_dir):

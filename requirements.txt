@@ -6,5 +6,6 @@ pandas
 pooch
 pygedai
 scikit-learn
+scipy
 torch
 urllib3

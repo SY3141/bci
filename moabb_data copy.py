@@ -9,7 +9,6 @@ from pathlib import Path
 
 import torch
 import urllib3
-from scipy.signal import resample_poly
 
 
 PROCESSED_DATA_DIR = "processed_data"
@@ -174,7 +173,7 @@ def truncate_subjects(data_dir=PROCESSED_DATA_DIR, max_epochs=200):
             print(f"Error loading Subject {subject_num}: {exc}")
 
 
-def downsample_subjects(data_dir=PROCESSED_DATA_DIR, downsample_ratio=4, min_timepoints=400):
+def downsample_subjects(data_dir=PROCESSED_DATA_DIR, downsample_ratio=5, min_timepoints=400):
     print(f"Downsampling subjects by a ratio of {downsample_ratio}...")
     for file_path in get_cache_files(data_dir):
         subject_num = int(file_path.stem.split("_")[-1])
@@ -189,8 +188,7 @@ def downsample_subjects(data_dir=PROCESSED_DATA_DIR, downsample_ratio=4, min_tim
                 )
                 continue
 
-            X_sub = resample_poly(X_sub, up=1, down=downsample_ratio, axis=-1)
-            X_sub = torch.as_tensor(X_sub, dtype=torch.float32)
+            X_sub = X_sub[:, :, ::downsample_ratio]
             torch.save((X_sub, y_sub), file_path)
             print(f"Subject {subject_num}: Downsampled {original_timepoints} -> {X_sub.shape[2]} timepoints.")
         except Exception as exc:
@@ -282,7 +280,7 @@ def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.fl
 def apply_pygedai_preprocessing(
     data_dir=PROCESSED_DATA_DIR,
     output_dir=PYGEDAI_DATA_DIR,
-    sfreq=CHO2017_SFREQ,
+    sfreq=CHO2017_SFREQ / 5,
     mne_data_dir=MNE_DATA_DIR,
 ):
     run_gedai = _load_gedai()
@@ -344,14 +342,14 @@ def prepare_data(
     data_dir=PROCESSED_DATA_DIR,
     mne_data_dir=MNE_DATA_DIR,
     max_epochs=200,
-    downsample_ratio=4,
+    downsample_ratio=5,
     min_timepoints=400,
 ):
     download_subjects(data_dir=data_dir, mne_data_dir=mne_data_dir)
     inspect_subject(subject=1, data_dir=data_dir)
     truncate_subjects(data_dir=data_dir, max_epochs=max_epochs)
+    downsample_subjects(data_dir=data_dir, downsample_ratio=downsample_ratio, min_timepoints=min_timepoints)
     apply_pygedai_preprocessing(data_dir=data_dir, output_dir=PYGEDAI_DATA_DIR, mne_data_dir=mne_data_dir)
-    downsample_subjects(data_dir=PYGEDAI_DATA_DIR, downsample_ratio=downsample_ratio, min_timepoints=min_timepoints)
 
 
 def main():
@@ -359,7 +357,7 @@ def main():
     parser.add_argument("--data-dir", default=PROCESSED_DATA_DIR)
     parser.add_argument("--mne-data-dir", default=MNE_DATA_DIR)
     parser.add_argument("--max-epochs", type=int, default=200)
-    parser.add_argument("--downsample-ratio", type=int, default=4)
+    parser.add_argument("--downsample-ratio", type=int, default=5)
     parser.add_argument("--min-timepoints", type=int, default=400)
     args = parser.parse_args()
 

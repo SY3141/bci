@@ -61,24 +61,9 @@ Each cached subject is limited to a maximum of 200 epochs:
 
 This creates a more uniform per-subject tensor shape before combining subjects.
 
-5. Downsampling
+5. PyGEDAI preprocessing
 
-The cached EEG tensors are downsampled along the time axis by taking every 5th sample:
-
-X_sub = X_sub[:, :, ::5]
-
-This reduces the temporal length and makes transformer training cheaper. The code includes a guard to avoid repeatedly shrinking already-downsampled data:
-
-- If a subject has fewer than 400 timepoints, downsampling is skipped.
-- Otherwise, the subject is downsampled and saved back to processed_data.
-
-With the Cho2017 sampling assumption, the effective sampling frequency after downsampling is:
-
-512 / 5 = 102.4 Hz
-
-6. PyGEDAI preprocessing
-
-The data module always applies pygedai preprocessing after download, truncation, and downsampling:
+The data module always applies pygedai preprocessing after download and truncation, before downsampling:
 
 python moabb_data.py
 
@@ -96,7 +81,7 @@ This replaces the earlier placeholder identity matrix. The reference covariance 
 For each epoch, the script calls pygedai's GEDAI cleaning function with:
 
 - epoch_data shaped as (channels, timepoints)
-- sfreq = 102.4 Hz
+- sfreq = 512 Hz
 - leadfield = the interpolated reference covariance from standard_1005 channel coordinates
 
 The cleaned output is extracted from:
@@ -106,6 +91,21 @@ out["cleaned"]
 Cleaned subject tensors are saved to:
 
 pygedai_processed/subject_<id>.pt
+
+6. Downsampling
+
+The cleaned PyGEDAI tensors are downsampled along the time axis using scipy.signal.resample_poly:
+
+eeg_ds = resample_poly(eeg, up=1, down=4, axis=-1)
+
+This reduces the temporal length and makes transformer training cheaper. The code includes a guard to avoid repeatedly shrinking already-downsampled data:
+
+- If a subject has fewer than 400 timepoints, downsampling is skipped.
+- Otherwise, the subject is downsampled and saved back to pygedai_processed.
+
+With the Cho2017 sampling assumption, the effective sampling frequency after downsampling is:
+
+512 / 4 = 128 Hz
 
 The spectrogram module reads from pygedai_processed, so moabb_data.py must be run before spectrogram conversion.
 
@@ -129,7 +129,7 @@ For each subject, the input tensor is expected to have shape:
 
 The script computes an STFT for every epoch and channel using default settings:
 
-- sampling frequency: 102.4 Hz
+- sampling frequency: 128 Hz
 - n_fft: 64
 - hop_length: 4
 - frequency band retained: 8-32 Hz
