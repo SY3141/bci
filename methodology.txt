@@ -263,7 +263,7 @@ Training uses:
 
 - Loss: CrossEntropyLoss
 - Optimizer: AdamW
-- Learning rate: 0.001
+- Learning rate: 0.003
 - Weight decay: 1e-4
 - Scheduler: CosineAnnealingLR
 - Default epochs: 50

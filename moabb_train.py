@@ -135,7 +135,7 @@ def accuracy(model, loader, device):
     return 100 * correct / total
 
 
-def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, lr=0.001, weight_decay=1e-4):
+def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, lr=0.003, weight_decay=1e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EEGTransformer(
         n_channels=full_dataset.n_channels,
@@ -213,7 +213,7 @@ def run_scaling_law(
             n_classes=full_dataset.num_classes,
         ).to(device)
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-4)
 
         for _ in range(epochs):
             model.train()
