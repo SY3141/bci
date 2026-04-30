@@ -135,6 +135,19 @@ def accuracy(model, loader, device):
     return 100 * correct / total
 
 
+def average_loss(model, loader, criterion, device):
+    model.eval()
+    total_loss, total_samples = 0.0, 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * labels.size(0)
+            total_samples += labels.size(0)
+    return total_loss / total_samples
+
+
 def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, lr=0.003, weight_decay=1e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EEGTransformer(
@@ -146,10 +159,13 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    train_losses = []
+    val_losses = []
 
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
+        train_samples = 0
 
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
@@ -160,7 +176,8 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += loss.item() * labels.size(0)
+            train_samples += labels.size(0)
 
             if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_loader):
                 print(
@@ -170,15 +187,31 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
                 )
 
         scheduler.step()
+        train_loss = running_loss / train_samples
+        val_loss = average_loss(model, val_loader, criterion, device)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
         print()
 
         if (epoch + 1) % 10 == 0:
             val_acc = accuracy(model, val_loader, device)
             current_lr = scheduler.get_last_lr()[0]
             print(
-                f"Epoch {epoch + 1}/{epochs} | Avg Loss: {running_loss / len(train_loader):.4f} "
-                f"| Val Accuracy: {val_acc:.2f}% | LR: {current_lr:.6f}\n"
+                f"Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.4f} "
+                f"| Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc:.2f}% | LR: {current_lr:.6f}\n"
             )
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, epochs + 1), train_losses, label="Training Loss", linewidth=2)
+    plt.plot(range(1, epochs + 1), val_losses, label="Validation Loss", linewidth=2)
+    plt.title("Training and Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True, linestyle="--", alpha=0.7)
+    plt.legend()
+    plt.savefig("loss.png", dpi=300, bbox_inches="tight")
+    print("Loss graph saved as loss.png")
+    plt.close()
 
     test_acc = accuracy(model, test_loader, device)
     print(f"Final Test Accuracy: {test_acc:.2f}%")
@@ -195,13 +228,13 @@ def run_scaling_law(
     output_path="scaling_law.png",
 ):
     if data_fractions is None:
-        data_fractions = [0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
+        data_fractions = [0.125, 0.25, 0.5, 1.0]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     val_accuracies = []
 
     for frac in data_fractions:
-        print(f"Training on {int(frac * 100)}% of the training data...")
+        print(f"Training on {frac * 100:g}% of the training data...")
 
         num_samples = int(len(train_dataset) * frac)
         train_subset = Subset(train_dataset, list(range(num_samples)))
@@ -229,7 +262,7 @@ def run_scaling_law(
         val_accuracies.append(val_acc)
         print(
             f"Validation Accuracy (Evaluated on fixed 20% validation set) "
-            f"for {int(frac * 100)}% train data: {val_acc:.2f}%\n"
+            f"for {frac * 100:g}% train data: {val_acc:.2f}%\n"
         )
 
     plt.figure(figsize=(10, 6))

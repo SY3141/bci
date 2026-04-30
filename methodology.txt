@@ -280,6 +280,10 @@ During each epoch:
 
 Every 10 epochs, validation accuracy is computed on the fixed validation set.
 
+Training and validation loss are tracked every epoch and saved as:
+
+loss.png
+
 Final Evaluation
 
 After training, the model is evaluated once on the held-out test set. The script reports:
@@ -292,11 +296,9 @@ Scaling-Law Experiment
 
 Unless --skip-scaling is passed, the training script also runs a scaling experiment. It trains fresh models on increasing fractions of the training set:
 
-- 10%
-- 20%
-- 40%
-- 60%
-- 80%
+- 12.5%
+- 25%
+- 50%
 - 100%
 
 Each model is evaluated on the same fixed validation set. The resulting validation accuracies are plotted against the number of training samples and saved as:
