@@ -148,7 +148,21 @@ def average_loss(model, loader, criterion, device):
     return total_loss / total_samples
 
 
-def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, lr=0.003, weight_decay=1e-4):
+def train_model(
+    full_dataset,
+    train_loader,
+    val_loader,
+    test_loader,
+    epochs=50,
+    lr=0.003,
+    weight_decay=1e-4,
+    eval_every=1,
+    continue_until_improves=False,
+    max_epochs=None,
+    min_delta=0.0,
+    patience=None,
+    checkpoint_path="best_model.pt",
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EEGTransformer(
         n_channels=full_dataset.n_channels,
@@ -158,11 +172,23 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    if max_epochs is None:
+        max_epochs = epochs * 4 if continue_until_improves else epochs
+    if max_epochs < epochs:
+        raise ValueError("--max-epochs must be greater than or equal to --epochs")
+
+    scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs)
     train_losses = []
     val_losses = []
+    val_accuracies = []
+    best_val_acc = float("-inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    baseline_best_acc = None
+    completed_epochs = 0
+    checkpoint_path = Path(checkpoint_path)
 
-    for epoch in range(epochs):
+    for epoch in range(max_epochs):
         model.train()
         running_loss = 0.0
         train_samples = 0
@@ -181,7 +207,7 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
 
             if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_loader):
                 print(
-                    f"\rEpoch [{epoch + 1}/{epochs}] | Batch [{batch_idx + 1}/{len(train_loader)}] "
+                    f"\rEpoch [{epoch + 1}/{max_epochs}] | Batch [{batch_idx + 1}/{len(train_loader)}] "
                     f"| Current Loss: {loss.item():.4f}",
                     end="",
                 )
@@ -192,18 +218,75 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         print()
+        completed_epochs = epoch + 1
 
-        if (epoch + 1) % 10 == 0:
+        should_eval = (
+            (epoch + 1) % eval_every == 0
+            or (epoch + 1) == epochs
+            or (epoch + 1) == max_epochs
+            or (continue_until_improves and epoch + 1 == epochs)
+        )
+        if should_eval:
             val_acc = accuracy(model, val_loader, device)
+            val_accuracies.append((epoch + 1, val_acc))
             current_lr = scheduler.get_last_lr()[0]
+            improved = val_acc > best_val_acc + min_delta
+            if improved:
+                best_val_acc = val_acc
+                best_epoch = epoch + 1
+                epochs_without_improvement = 0
+                torch.save(
+                    {
+                        "epoch": best_epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_accuracy": best_val_acc,
+                        "val_loss": val_loss,
+                    },
+                    checkpoint_path,
+                )
+            else:
+                epochs_without_improvement += eval_every
+
             print(
-                f"Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.4f} "
-                f"| Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc:.2f}% | LR: {current_lr:.6f}\n"
+                f"Epoch {epoch + 1}/{max_epochs} | Train Loss: {train_loss:.4f} "
+                f"| Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc:.2f}% "
+                f"| Best: {best_val_acc:.2f}% @ epoch {best_epoch} | LR: {current_lr:.6f}\n"
             )
 
+            if continue_until_improves and epoch + 1 == epochs:
+                baseline_best_acc = best_val_acc
+                print(
+                    f"Base epoch budget reached. Continuing until validation accuracy exceeds "
+                    f"{baseline_best_acc:.2f}% by more than {min_delta:.2f}, up to epoch {max_epochs}.\n"
+                )
+
+            if (
+                continue_until_improves
+                and baseline_best_acc is not None
+                and epoch + 1 > epochs
+                and val_acc > baseline_best_acc + min_delta
+            ):
+                print(f"Validation accuracy improved after the base run at epoch {epoch + 1}; stopping.\n")
+                break
+
+            if patience is not None and epochs_without_improvement >= patience:
+                print(f"No validation improvement for {patience} epochs; stopping early.\n")
+                break
+
+        elif continue_until_improves and epoch + 1 == epochs:
+            baseline_best_acc = best_val_acc
+            print(
+                f"Base epoch budget reached. Continuing until validation accuracy improves, "
+                f"up to epoch {max_epochs}.\n"
+            )
+
+        if not continue_until_improves and epoch + 1 >= epochs:
+            break
+
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, epochs + 1), train_losses, label="Training Loss", linewidth=2)
-    plt.plot(range(1, epochs + 1), val_losses, label="Validation Loss", linewidth=2)
+    plt.plot(range(1, completed_epochs + 1), train_losses, label="Training Loss", linewidth=2)
+    plt.plot(range(1, completed_epochs + 1), val_losses, label="Validation Loss", linewidth=2)
     plt.title("Training and Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -212,6 +295,14 @@ def train_model(full_dataset, train_loader, val_loader, test_loader, epochs=50, 
     plt.savefig("loss.png", dpi=300, bbox_inches="tight")
     print("Loss graph saved as loss.png")
     plt.close()
+
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(
+            f"Loaded best validation checkpoint from epoch {checkpoint['epoch']} "
+            f"({checkpoint['val_accuracy']:.2f}% val accuracy)."
+        )
 
     test_acc = accuracy(model, test_loader, device)
     print(f"Final Test Accuracy: {test_acc:.2f}%")
@@ -288,18 +379,64 @@ def main():
     parser = argparse.ArgumentParser(description="Train EEG transformer on cached MOABB data.")
     parser.add_argument("--num-subjects", type=int, default=52)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--eval-every", type=int, default=1, help="Validate every N epochs.")
+    parser.add_argument(
+        "--continue-until-improves",
+        action="store_true",
+        help="After --epochs, keep training until validation accuracy improves, bounded by --max-epochs.",
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=None,
+        help="Hard cap for training. Defaults to --epochs, or 4x --epochs with --continue-until-improves.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation accuracy increase, in percentage points, required to count as an improvement.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Stop after this many epochs without validation improvement.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        default="best_model.pt",
+        help="Where to save the best validation checkpoint.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-scaling", action="store_true")
     parser.add_argument("--scaling-epochs", type=int, default=100)
     args = parser.parse_args()
+
+    if args.eval_every < 1:
+        raise ValueError("--eval-every must be at least 1")
+    if args.patience is not None and args.patience < 1:
+        raise ValueError("--patience must be at least 1")
 
     full_dataset, train_dataset, _, _, train_loader, val_loader, test_loader = create_loaders(
         num_subjects=args.num_subjects,
         batch_size=args.batch_size,
         seed=args.seed,
     )
-    train_model(full_dataset, train_loader, val_loader, test_loader, epochs=args.epochs)
+    train_model(
+        full_dataset,
+        train_loader,
+        val_loader,
+        test_loader,
+        epochs=args.epochs,
+        eval_every=args.eval_every,
+        continue_until_improves=args.continue_until_improves,
+        max_epochs=args.max_epochs,
+        min_delta=args.min_delta,
+        patience=args.patience,
+        checkpoint_path=args.checkpoint_path,
+    )
 
     if not args.skip_scaling:
         run_scaling_law(
