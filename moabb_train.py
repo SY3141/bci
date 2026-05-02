@@ -10,8 +10,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 
+DEFAULT_DATA_DIR = "downsampled"
+
+
 class EEGCacheDataset(Dataset):
-    def __init__(self, data_dir="spectrogram_data", num_subjects=52):
+    def __init__(self, data_dir=DEFAULT_DATA_DIR, num_subjects=52):
         self.data_dir = Path(data_dir)
         cache_files = sorted(
             self.data_dir.glob("subject_*.pt"),
@@ -33,7 +36,7 @@ class EEGCacheDataset(Dataset):
         print(f"\nSuccessfully loaded {len(self.cache_files)} subjects.")
 
         if not X_list:
-            raise ValueError(f"No subject_*.pt files found in {self.data_dir}. Run moabb_spectrogram.py first.")
+            raise ValueError(f"No subject_*.pt files found in {self.data_dir}. Run moabb_data.py first.")
 
         X_combined = np.concatenate(X_list, axis=0)
         y_combined = np.array(y_list)
@@ -97,7 +100,7 @@ class EEGTransformer(nn.Module):
         return self.classifier(x[:, 0, :])
 
 
-def create_loaders(data_dir="spectrogram_data", num_subjects=52, batch_size=32, seed=42):
+def create_loaders(data_dir=DEFAULT_DATA_DIR, num_subjects=52, batch_size=32, seed=42):
     full_dataset = EEGCacheDataset(data_dir=data_dir, num_subjects=num_subjects)
 
     train_size = int(0.7 * len(full_dataset))
@@ -377,6 +380,7 @@ def run_scaling_law(
 
 def main():
     parser = argparse.ArgumentParser(description="Train EEG transformer on cached MOABB data.")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--num-subjects", type=int, default=52)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
@@ -420,6 +424,7 @@ def main():
         raise ValueError("--patience must be at least 1")
 
     full_dataset, train_dataset, _, _, train_loader, val_loader, test_loader = create_loaders(
+        data_dir=args.data_dir,
         num_subjects=args.num_subjects,
         batch_size=args.batch_size,
         seed=args.seed,

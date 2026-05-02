@@ -2,7 +2,7 @@
 processed_data/
 mne_data/
 pygedai_processed/
-spectrogram_data/
+downsampled/
 
 # Python caches
 __pycache__/

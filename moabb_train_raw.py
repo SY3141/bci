@@ -1,4 +1,6 @@
 import argparse
+import math
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -11,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 
 class EEGCacheDataset(Dataset):
-    def __init__(self, data_dir="processed_data", num_subjects=52):
+    def __init__(self, data_dir="processed_data", num_subjects=52, cache_subjects=1):
         self.data_dir = Path(data_dir)
         cache_files = sorted(
             self.data_dir.glob("subject_*.pt"),
@@ -19,40 +21,133 @@ class EEGCacheDataset(Dataset):
         )
 
         self.cache_files = cache_files[:num_subjects]
-        self.encoder = LabelEncoder()
-
-        print(f"Loading {len(self.cache_files)} subjects from {self.data_dir}...")
-        X_list, y_list = [], []
-
-        for i, file_path in enumerate(self.cache_files):
-            print(f"\rLoading {file_path.name} ({i + 1}/{len(self.cache_files)})...", end="", flush=True)
-            X_sub, y_sub = torch.load(file_path, weights_only=False)
-            X_list.append(X_sub)
-            y_list.extend(y_sub)
-
-        print(f"\nSuccessfully loaded {len(self.cache_files)} subjects.")
-
-        if not X_list:
+        if not self.cache_files:
             raise ValueError(f"No subject_*.pt files found in {self.data_dir}. Run moabb_data.py first.")
 
-        X_combined = np.concatenate(X_list, axis=0)
-        y_combined = np.array(y_list)
-        y_encoded = self.encoder.fit_transform(y_combined)
+        self.encoder = LabelEncoder()
+        self.cache_subjects = max(1, cache_subjects)
+        self._subject_cache = OrderedDict()
 
-        self.X_tensor = torch.tensor(X_combined, dtype=torch.float32).unsqueeze(1)
-        self.y_tensor = torch.tensor(y_encoded, dtype=torch.long)
+        print(f"Indexing {len(self.cache_files)} subjects from {self.data_dir}...")
+        subject_lengths = []
+        raw_labels_by_subject = []
+        n_channels, n_timepoints = None, None
+
+        for i, file_path in enumerate(self.cache_files):
+            print(f"\rIndexing {file_path.name} ({i + 1}/{len(self.cache_files)})...", end="", flush=True)
+            X_sub, y_sub = torch.load(file_path, weights_only=False)
+
+            if X_sub.shape[0] != len(y_sub):
+                raise ValueError(f"{file_path} has {X_sub.shape[0]} epochs but {len(y_sub)} labels.")
+
+            if n_channels is None:
+                n_channels = X_sub.shape[1]
+                n_timepoints = X_sub.shape[2]
+            elif X_sub.shape[1:] != (n_channels, n_timepoints):
+                raise ValueError(
+                    f"{file_path} has shape {X_sub.shape[1:]}, expected {(n_channels, n_timepoints)}."
+                )
+
+            subject_lengths.append(len(y_sub))
+            raw_labels_by_subject.append(np.array(y_sub))
+            del X_sub, y_sub
+
+        print(f"\nSuccessfully indexed {len(self.cache_files)} subjects.")
+
+        self.subject_offsets = np.concatenate(([0], np.cumsum(subject_lengths))).astype(np.int64)
+        self.encoder.fit(np.concatenate(raw_labels_by_subject))
+        self.labels_by_subject = [
+            torch.tensor(self.encoder.transform(labels), dtype=torch.long) for labels in raw_labels_by_subject
+        ]
+        self.total_epochs = int(self.subject_offsets[-1])
         self.num_classes = len(self.encoder.classes_)
-        self.n_channels = self.X_tensor.shape[2]
-        self.n_timepoints = self.X_tensor.shape[3]
+        self.n_channels = n_channels
+        self.n_timepoints = n_timepoints
 
-        print(f"Dataset Tensor Shape: {self.X_tensor.shape}")
-        print(f"Labels Tensor Shape: {self.y_tensor.shape}")
+        print(f"Dataset Shape: ({self.total_epochs}, 1, {self.n_channels}, {self.n_timepoints})")
+        print(f"Labels Shape: ({self.total_epochs},)")
 
     def __len__(self):
-        return len(self.X_tensor)
+        return self.total_epochs
 
     def __getitem__(self, idx):
-        return self.X_tensor[idx], self.y_tensor[idx]
+        subject_idx, epoch_idx = self._locate_epoch(idx)
+        X_sub = self._load_subject(subject_idx)
+        return X_sub[epoch_idx].unsqueeze(0), self.labels_by_subject[subject_idx][epoch_idx]
+
+    def subject_index_for(self, idx):
+        subject_idx, _ = self._locate_epoch(idx)
+        return subject_idx
+
+    def _locate_epoch(self, idx):
+        idx = int(idx)
+        if idx < 0:
+            idx += self.total_epochs
+        if idx < 0 or idx >= self.total_epochs:
+            raise IndexError(idx)
+
+        subject_idx = int(np.searchsorted(self.subject_offsets, idx, side="right") - 1)
+        epoch_idx = idx - int(self.subject_offsets[subject_idx])
+        return subject_idx, epoch_idx
+
+    def _load_subject(self, subject_idx):
+        if subject_idx in self._subject_cache:
+            self._subject_cache.move_to_end(subject_idx)
+            return self._subject_cache[subject_idx]
+
+        X_sub, _ = torch.load(self.cache_files[subject_idx], weights_only=False)
+        X_sub = torch.as_tensor(X_sub, dtype=torch.float32)
+        self._subject_cache[subject_idx] = X_sub
+        self._subject_cache.move_to_end(subject_idx)
+
+        while len(self._subject_cache) > self.cache_subjects:
+            self._subject_cache.popitem(last=False)
+
+        return X_sub
+
+
+def _resolve_root_index(dataset, idx):
+    while isinstance(dataset, Subset):
+        idx = int(dataset.indices[idx])
+        dataset = dataset.dataset
+    return dataset, int(idx)
+
+
+class SubjectGroupedBatchSampler:
+    def __init__(self, dataset, batch_size, shuffle=False, seed=42):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        groups = defaultdict(list)
+        for local_idx in range(len(dataset)):
+            current_root, root_idx = _resolve_root_index(dataset, local_idx)
+            groups[current_root.subject_index_for(root_idx)].append(local_idx)
+
+        self.groups = list(groups.values())
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+
+        batches = []
+        for group in self.groups:
+            indices = list(group)
+            if self.shuffle:
+                order = torch.randperm(len(indices), generator=generator).tolist()
+                indices = [indices[i] for i in order]
+            batches.extend(indices[i : i + self.batch_size] for i in range(0, len(indices), self.batch_size))
+
+        if self.shuffle:
+            order = torch.randperm(len(batches), generator=generator).tolist()
+            batches = [batches[i] for i in order]
+
+        yield from batches
+
+    def __len__(self):
+        return sum(math.ceil(len(group) / self.batch_size) for group in self.groups)
 
 
 class EEGTransformer(nn.Module):
@@ -97,8 +192,8 @@ class EEGTransformer(nn.Module):
         return self.classifier(x[:, 0, :])
 
 
-def create_loaders(data_dir="processed_data", num_subjects=52, batch_size=32, seed=42):
-    full_dataset = EEGCacheDataset(data_dir=data_dir, num_subjects=num_subjects)
+def create_loaders(data_dir="processed_data", num_subjects=52, batch_size=32, seed=42, cache_subjects=1, num_workers=0):
+    full_dataset = EEGCacheDataset(data_dir=data_dir, num_subjects=num_subjects, cache_subjects=cache_subjects)
 
     train_size = int(0.7 * len(full_dataset))
     val_size = int(0.2 * len(full_dataset))
@@ -109,9 +204,21 @@ def create_loaders(data_dir="processed_data", num_subjects=52, batch_size=32, se
         generator=torch.Generator().manual_seed(seed),
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=SubjectGroupedBatchSampler(train_dataset, batch_size=batch_size, shuffle=True, seed=seed),
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_sampler=SubjectGroupedBatchSampler(val_dataset, batch_size=batch_size, shuffle=False, seed=seed),
+        num_workers=num_workers,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_sampler=SubjectGroupedBatchSampler(test_dataset, batch_size=batch_size, shuffle=False, seed=seed),
+        num_workers=num_workers,
+    )
 
     print(
         f"Split sizes: train={len(train_dataset)} ({len(train_dataset) / len(full_dataset):.0%}), "
@@ -225,6 +332,8 @@ def run_scaling_law(
     data_fractions=None,
     epochs=100,
     batch_size=32,
+    seed=42,
+    num_workers=0,
     output_path="scaling_law.png",
 ):
     if data_fractions is None:
@@ -238,7 +347,11 @@ def run_scaling_law(
 
         num_samples = int(len(train_dataset) * frac)
         train_subset = Subset(train_dataset, list(range(num_samples)))
-        subset_train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+        subset_train_loader = DataLoader(
+            train_subset,
+            batch_sampler=SubjectGroupedBatchSampler(train_subset, batch_size=batch_size, shuffle=True, seed=seed),
+            num_workers=num_workers,
+        )
 
         model = EEGTransformer(
             n_channels=full_dataset.n_channels,
@@ -286,18 +399,24 @@ def run_scaling_law(
 
 def main():
     parser = argparse.ArgumentParser(description="Train EEG transformer on cached MOABB data.")
+    parser.add_argument("--data-dir", default="processed_data")
     parser.add_argument("--num-subjects", type=int, default=52)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cache-subjects", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--skip-scaling", action="store_true")
     parser.add_argument("--scaling-epochs", type=int, default=100)
     args = parser.parse_args()
 
     full_dataset, train_dataset, _, _, train_loader, val_loader, test_loader = create_loaders(
+        data_dir=args.data_dir,
         num_subjects=args.num_subjects,
         batch_size=args.batch_size,
         seed=args.seed,
+        cache_subjects=args.cache_subjects,
+        num_workers=args.num_workers,
     )
     train_model(full_dataset, train_loader, val_loader, test_loader, epochs=args.epochs)
 
@@ -308,6 +427,8 @@ def main():
             val_loader,
             epochs=args.scaling_epochs,
             batch_size=args.batch_size,
+            seed=args.seed,
+            num_workers=args.num_workers,
         )
 
 

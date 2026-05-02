@@ -3,8 +3,7 @@ Methodology
 This project trains a transformer-based classifier on motor-imagery EEG data from the MOABB Cho2017 dataset. The workflow is split into two modules:
 
 - moabb_data.py prepares and caches the EEG data.
-- moabb_spectrogram.py converts cleaned EEG time series into log-power spectrogram tensors.
-- moabb_train.py loads the spectrogram tensors, builds the model, trains it, and evaluates it.
+- moabb_train.py loads the prepared EEG tensors, builds the model, trains it, and evaluates it.
 
 Data Pipeline
 
@@ -101,55 +100,17 @@ eeg_ds = resample_poly(eeg, up=1, down=4, axis=-1)
 This reduces the temporal length and makes transformer training cheaper. The code includes a guard to avoid repeatedly shrinking already-downsampled data:
 
 - If a subject has fewer than 400 timepoints, downsampling is skipped.
-- Otherwise, the subject is downsampled and saved back to pygedai_processed.
+- Otherwise, the subject is downsampled and saved to downsampled.
 
 With the Cho2017 sampling assumption, the effective sampling frequency after downsampling is:
 
 512 / 4 = 128 Hz
 
-The spectrogram module reads from pygedai_processed, so moabb_data.py must be run before spectrogram conversion.
-
-7. Spectrogram conversion
-
-moabb_spectrogram.py converts the PyGEDAI-cleaned time series into log-power STFT spectrogram features:
-
-python moabb_spectrogram.py
-
-The input directory is:
-
-pygedai_processed
-
-The output directory is:
-
-spectrogram_data
-
-For each subject, the input tensor is expected to have shape:
-
-(epochs, channels, timepoints)
-
-The script computes an STFT for every epoch and channel using default settings:
-
-- sampling frequency: 128 Hz
-- n_fft: 64
-- hop_length: 4
-- frequency band retained: 8-32 Hz
-- transform: log power
-
-The spectrogram initially has separate channel, frequency, and spectrogram-time axes. To keep the data compatible with the existing CNN-transformer, channel and frequency are flattened together:
-
-(epochs, channels, frequency_bins, spectrogram_timepoints)
-
-becomes:
-
-(epochs, channels * frequency_bins, spectrogram_timepoints)
-
-Each channel-frequency row is normalized over spectrogram time within the same epoch. The saved files remain PyTorch tuples:
-
-(X_spectrogram, y_sub)
+The training module reads from downsampled, so moabb_data.py is the only required data preparation step before training.
 
 Training Data Loading
 
-moabb_train.py loads all available subject files from spectrogram_data by default. It uses up to 52 subjects:
+moabb_train.py loads all available subject files from downsampled by default. It uses up to 52 subjects:
 
 - Files are sorted numerically by subject id.
 - EEG tensors from all selected subjects are concatenated along the epoch dimension.
@@ -307,8 +268,8 @@ scaling_law.png
 
 Important Implementation Notes
 
-- moabb_train.py always loads from spectrogram_data.
-- Run moabb_data.py, then moabb_spectrogram.py, before training.
-- The downsampling step is destructive for processed_data files, but it skips tensors below 400 timepoints to avoid repeated shrinking.
+- moabb_train.py loads from downsampled by default.
+- Run moabb_data.py before training.
+- The downsampling step writes to downsampled and skips tensors below 400 timepoints to avoid repeated shrinking.
 - The train/validation/test split is trial-level, not subject-level. This means trials from the same subject can appear in different splits.
 - The model currently does not apply explicit train-set-only normalization before training.
