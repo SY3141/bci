@@ -1,275 +1,305 @@
 Methodology
 
-This project trains a transformer-based classifier on motor-imagery EEG data from the MOABB Cho2017 dataset. The workflow is split into two modules:
+This project trains a motor-imagery EEG classifier on the MOABB Cho2017 dataset. The workflow is split into data preparation, spectral inspection, model training, and evaluation.
 
-- moabb_data.py prepares and caches the EEG data.
-- moabb_train.py loads the prepared EEG tensors, builds the model, trains it, and evaluates it.
+Main modules:
+
+- moabb_data.py prepares raw, PyGEDAI-cleaned, and downsampled EEG tensors.
+- moabb_train.py trains and evaluates the EEG classifier.
+- psd.py plots PSDs for raw tensors.
+- psd_pygedai.py plots PSDs for PyGEDAI-cleaned tensors.
+- downsampled_psd.py plots PSDs for downsampled tensors.
 
 Data Pipeline
 
-1. Dataset source
+1. Dataset Source
 
-The data source is the Cho2017 motor imagery dataset from MOABB. The paradigm is configured as:
+The data source is the Cho2017 motor imagery dataset from MOABB.
 
 - Dataset: Cho2017
-- Paradigm: MotorImagery
-- Frequency band: 8-32 Hz
-- Original sampling frequency assumption: 512 Hz
+- Task: motor imagery
 - Classes: left_hand and right_hand
+- Original sampling frequency assumption: 512 Hz
+- EEG epochs are shaped as (epochs, channels, timepoints)
 
-The 8-32 Hz band targets the mu and beta rhythms commonly used in motor imagery decoding.
+The task targets motor-imagery rhythms, especially mu and beta activity over sensorimotor regions.
 
-2. Download and local caching
+2. Raw Cache
 
-moabb_data.py configures MNE and MOABB to use the local mne_data directory. It then iterates through the Cho2017 subject list and downloads each missing subject individually.
-
-For each subject, MOABB returns:
-
-- X_sub: EEG epochs with shape (epochs, channels, timepoints)
-- y_sub: class labels for each epoch
-
-Each subject is saved as a PyTorch file:
+moabb_data.py configures MNE/MOABB to use the local mne_data directory, downloads each subject, extracts EEG epochs and labels, and saves one cache file per subject:
 
 raw/subject_<id>.pt
 
-The saved file contains a tuple:
+Each file contains:
 
 (X_sub, y_sub)
 
-This avoids repeatedly downloading and re-extracting the raw MOABB data.
+where X_sub is EEG data and y_sub contains the class labels.
 
-3. Subject inspection
+Subjects are capped at 200 epochs by default. If a subject has more than 200 epochs, only the first 200 are kept.
 
-After downloading, subject 1 is inspected. The script prints:
+3. PyGEDAI Preprocessing
 
-- Python types for EEG data and labels
-- Tensor shape
-- Number of epochs
-- Number of channels
-- Number of timepoints
-- Label counts per class
+After raw caching and truncation, moabb_data.py applies PyGEDAI cleaning.
 
-This is a quick sanity check that the cache contains the expected binary motor-imagery labels.
+The script builds a reference covariance from Cho2017 channel locations by:
 
-4. Epoch truncation
+- Loading subject 1 from Cho2017 to obtain EEG channel names.
+- Loading MNE's standard_1005 montage.
+- Matching Cho2017 channel names to standard_1005 coordinates.
+- Passing a channel coordinate DataFrame to pygedai.interpolate_ref_cov.
 
-Each cached subject is limited to a maximum of 200 epochs:
-
-- If a subject has more than 200 epochs, only the first 200 are kept.
-- If a subject has fewer than 200 epochs, the script reports that count.
-
-This creates a more uniform per-subject tensor shape before combining subjects.
-
-5. PyGEDAI preprocessing
-
-The data module always applies pygedai preprocessing after download and truncation, before downsampling:
-
-python moabb_data.py
-
-Before cleaning epochs, the script builds a PyGEDAI reference covariance from Cho2017 channel locations:
-
-- It fetches the first available run from Cho2017 subject 1 to get the exact EEG channel names.
-- It loads MNE's standard_1005 montage.
-- It maps each Cho2017 channel name to its standard_1005 X, Y, Z coordinate.
-- It creates a pandas DataFrame with channel_name, X, Y, and Z columns.
-- It passes that DataFrame to pygedai.interpolate_ref_cov.
-- The resulting reference covariance tensor is moved to CUDA when a GPU is available, otherwise CPU.
-
-This replaces the earlier placeholder identity matrix. The reference covariance rows are built in the same order as the Cho2017 EEG channel names, so row 0 in the covariance corresponds to row 0 in the EEG epoch tensor.
-
-For each epoch, the script calls pygedai's GEDAI cleaning function with:
+Each epoch is passed to PyGEDAI with:
 
 - epoch_data shaped as (channels, timepoints)
 - sfreq = 512 Hz
-- leadfield = the interpolated reference covariance from standard_1005 channel coordinates
+- leadfield = the interpolated reference covariance
 
-The cleaned output is extracted from:
+The cleaned tensor is read from:
 
 out["cleaned"]
 
-Cleaned subject tensors are saved to:
+Cleaned subject files are saved to:
 
 pygedai_processed/subject_<id>.pt
 
-6. Downsampling
+If pygedai_processed/subject_<id>.pt already exists, that subject is skipped before expensive PyGEDAI processing starts. This allows interrupted preprocessing runs to resume from the next missing subject.
 
-The cleaned PyGEDAI tensors are downsampled along the time axis using scipy.signal.resample_poly:
+4. Downsampling
 
-eeg_ds = resample_poly(eeg, up=1, down=4, axis=-1)
+PyGEDAI-cleaned tensors are downsampled from pygedai_processed into downsampled using scipy.signal.resample_poly:
 
-This reduces the temporal length and makes transformer training cheaper. The code includes a guard to avoid repeatedly shrinking already-downsampled data:
+resample_poly(X_sub, up=1, down=4, axis=-1)
 
-- If a subject has fewer than 400 timepoints, downsampling is skipped.
-- Otherwise, the subject is downsampled and saved to downsampled.
-
-With the Cho2017 sampling assumption, the effective sampling frequency after downsampling is:
+This is polyphase resampling along the time axis. With the 512 Hz sampling assumption, the effective downsampled sampling rate is:
 
 512 / 4 = 128 Hz
 
-The training module reads from downsampled, so moabb_data.py is the only required data preparation step before training.
+The downsampling function skips tensors with fewer than 400 timepoints to avoid repeatedly shrinking files that were already downsampled.
+
+5. PSD Inspection
+
+PSD helper scripts use scipy.signal.welch and average power spectral density across epochs and channels.
+
+- psd.py reads raw/subject_*.pt and writes raw_psd/subject_<id>_psd.png.
+- psd_pygedai.py reads pygedai_processed/subject_*.pt and writes pygedai_processed_psd/subject_<id>_psd.png.
+- downsampled_psd.py reads downsampled/subject_*.pt and writes downsampled_psd/subject_<id>_psd.png.
+
+Raw and PyGEDAI PSD plots assume 512 Hz. Downsampled PSD plots assume 128 Hz.
 
 Training Data Loading
 
-moabb_train.py loads all available subject files from downsampled by default. It uses up to 52 subjects:
+moabb_train.py reads from downsampled by default:
 
-- Files are sorted numerically by subject id.
-- EEG tensors from all selected subjects are concatenated along the epoch dimension.
-- Labels are concatenated and encoded with sklearn.preprocessing.LabelEncoder.
-- The final input tensor is converted to float32 and reshaped to:
+downsampled/subject_*.pt
+
+Files are sorted numerically by subject id. The selected subjects are concatenated along the epoch dimension.
+
+Labels are encoded with numpy.unique rather than sklearn. The input tensor is converted to float32 and reshaped to:
 
 (trials, 1, channels, timepoints)
 
-The extra dimension is a convolution input channel dimension used by the CNN front-end.
+The extra dimension is the convolution input channel dimension.
+
+Normalization
+
+Before training, EEG data is standardized per epoch and per EEG channel:
+
+X = (X - mean_over_time) / std_over_time
+
+This makes amplitude scale more consistent across subjects and channels.
 
 Dataset Split
 
-The combined dataset is split randomly with a fixed seed of 42:
+The dataset uses a stratified trial-level split with a fixed seed:
 
 - 70% training
 - 20% validation
 - 10% testing
 
-The validation set is used during training to monitor performance. The test set is held out until the final model evaluation after training.
+The split preserves class balance across train, validation, and test sets.
 
-Mini-batch DataLoaders are created with:
+Important note: the split is trial-level, not subject-level. Trials from the same subject can appear in different splits. This is useful for debugging and model development, but subject-independent generalization should eventually be measured with a subject-level or leave-one-subject-out split.
 
-- train_loader: shuffled
-- val_loader: not shuffled
-- test_loader: not shuffled
-- default batch size: 32
+Train-Time Augmentation
+
+Only the training subset receives augmentation. Validation and test tensors are not augmented.
+
+Default augmentations:
+
+- Random temporal shift up to 16 samples.
+- Additive Gaussian noise with standard deviation 0.03 after normalization.
+- Random channel dropout with probability 0.1.
+
+These augmentations are meant to improve robustness to timing jitter, sensor noise, and channel variation.
 
 Model Architecture
 
-The model is EEGTransformer, a CNN plus transformer encoder classifier.
+The model is EEGTransformer, a CNN plus transformer classifier with EEG-specific inductive bias.
 
 1. Input
 
-The model receives EEG batches shaped:
+The model receives:
 
 (batch, 1, channels, timepoints)
 
-2. CNN front-end
+2. Multi-Scale Temporal Front End
 
-The convolution block extracts local temporal and spatial EEG features before the transformer:
+The first stage uses parallel temporal convolution branches with kernel sizes:
 
-- Temporal convolution:
-  Conv2d(1, 40, kernel_size=(1, 25), padding=(0, 12))
+- 15
+- 31
+- 63
 
-- Spatial convolution across all EEG channels:
-  Conv2d(40, 40, kernel_size=(n_channels, 1), bias=False)
+Each branch learns temporal filters at a different scale. The branch outputs are concatenated along the feature-channel dimension.
 
-- Batch normalization:
-  BatchNorm2d(40)
+3. Depthwise Spatial Filtering
 
-- Nonlinearity:
-  ELU
+After temporal filtering, a depthwise spatial convolution spans all EEG channels:
 
-- Temporal pooling:
-  AvgPool2d(kernel_size=(1, 15), stride=(1, 15))
+kernel_size = (n_channels, 1)
+groups = temporal_channels
 
-- Regularization:
-  Dropout(0.5)
+This is EEGNet-style spatial filtering. It lets each temporal filter learn its own spatial pattern across electrodes.
 
-After this block, the tensor has 40 learned feature channels and a reduced temporal sequence length.
+4. Separable Temporal Block
 
-3. Sequence tokenization
+The model then applies:
 
-The CNN output is reshaped from convolution format into transformer sequence format:
+- depthwise temporal convolution
+- pointwise 1x1 convolution into d_model features
+- BatchNorm
+- ELU
+- squeeze-and-excitation channel attention
+- average pooling
+- dropout
 
-(batch, sequence_length, 40)
+This block extracts compact temporal features before transformer encoding.
 
-Each pooled time segment becomes one transformer token with 40 features.
+5. Positional Embedding
 
-4. Token projection
+The CNN output is reshaped into:
 
-A linear projection maps each 40-dimensional CNN token to the transformer embedding dimension:
+(batch, sequence_length, d_model)
 
-Linear(40, d_model)
+A learned positional embedding is added to preserve time-order information.
 
-The default d_model is 64.
+6. Transformer Encoder
 
-5. CLS token
-
-A learned classification token is prepended to each sequence. After transformer encoding, the final CLS token state is used as the summary representation for classification.
-
-6. Positional embedding
-
-A learned positional embedding is added to the full sequence, including the CLS token. This gives the transformer information about token order over time.
-
-7. Transformer encoder
-
-The transformer encoder uses:
+The default transformer settings are:
 
 - d_model = 64
-- n_heads = 8
-- n_layers = 4
-- feedforward dimension = 256
-- dropout = 0.3
+- n_heads = 4
+- n_layers = 2
+- feedforward dimension = d_model * 4
+- activation = GELU
+- dropout = 0.4
 - batch_first = True
 
-This allows the model to learn temporal dependencies between the pooled EEG feature tokens.
+The transformer is intentionally shallow to reduce overfitting on small EEG datasets.
 
-8. Classification head
+7. Attention Pooling
 
-The final CLS token embedding is passed through:
+Instead of using a CLS token, the model learns attention weights over all temporal tokens and computes a weighted average representation.
 
-- LayerNorm(d_model)
+8. Classification Head
+
+The pooled representation is passed through:
+
+- LayerNorm
+- Dropout
 - Linear(d_model, n_classes)
 
-For Cho2017 motor imagery, n_classes is usually 2: left_hand and right_hand.
+For Cho2017, n_classes is 2.
 
 Training Procedure
 
 Training uses:
 
-- Loss: CrossEntropyLoss
+- Loss: class-weighted soft cross entropy
+- Label smoothing: 0.05 by default
+- Mixup: alpha = 0.2 by default
 - Optimizer: AdamW
-- Learning rate: 0.003
-- Weight decay: 1e-4
+- Learning rate: 0.001 by default
+- Weight decay: 1e-3 by default
 - Scheduler: CosineAnnealingLR
-- Default epochs: 50
+- Gradient clipping: 1.0 by default
+- Default epochs: 20 from the CLI
+
+Class weights are computed from the full loaded dataset. Cho2017 subjects are currently balanced in this cache, so the weights are usually 1.0 and 1.0.
 
 During each epoch:
 
 1. The model is set to train mode.
-2. Each training batch is moved to GPU if available, otherwise CPU.
-3. Forward pass produces class logits.
-4. Cross-entropy loss is computed.
-5. Gradients are backpropagated.
-6. AdamW updates the weights.
-7. The cosine scheduler steps once per epoch.
+2. Training batches are moved to GPU if available, otherwise CPU.
+3. Labels are converted to smoothed one-hot targets.
+4. Mixup optionally combines examples and soft labels.
+5. The model produces class logits.
+6. Soft cross entropy is computed.
+7. Gradients are backpropagated.
+8. Gradients are clipped.
+9. AdamW updates weights.
+10. The cosine scheduler steps once per epoch.
 
-Every 10 epochs, validation accuracy is computed on the fixed validation set.
+Validation
 
-Training and validation loss are tracked every epoch and saved as:
+Validation runs every --eval-every epochs. The script tracks:
+
+- training loss
+- validation loss
+- validation accuracy
+- best validation checkpoint
+
+The best checkpoint is saved to:
+
+best_model.pt
+
+or the path passed through --checkpoint-path.
+
+The loss plot is saved to:
 
 loss.png
 
 Final Evaluation
 
-After training, the model is evaluated once on the held-out test set. The script reports:
+After training, moabb_train.py reloads the best validation checkpoint and evaluates it on the held-out test set. It prints:
 
 Final Test Accuracy
 
-This is the least-biased metric in the current pipeline because the test set is not used for training progress checks.
-
 Scaling-Law Experiment
 
-Unless --skip-scaling is passed, the training script also runs a scaling experiment. It trains fresh models on increasing fractions of the training set:
+Unless --skip-scaling is passed, the script trains fresh models on increasing fractions of the training set:
 
 - 12.5%
 - 25%
 - 50%
 - 100%
 
-Each model is evaluated on the same fixed validation set. The resulting validation accuracies are plotted against the number of training samples and saved as:
+Each model is evaluated on the same validation set, and the plot is saved to:
 
 scaling_law.png
 
-Important Implementation Notes
+Useful CLI Options
 
-- moabb_train.py loads from downsampled by default.
-- Run moabb_data.py before training.
-- The downsampling step writes to downsampled and skips tensors below 400 timepoints to avoid repeated shrinking.
-- The train/validation/test split is trial-level, not subject-level. This means trials from the same subject can appear in different splits.
-- The model currently does not apply explicit train-set-only normalization before training.
+- --data-dir: folder of subject_*.pt files; defaults to downsampled.
+- --num-subjects: number of subjects to load.
+- --batch-size: training batch size.
+- --epochs: base training epoch count.
+- --lr: AdamW learning rate.
+- --weight-decay: AdamW weight decay.
+- --label-smoothing: smoothing used for classification targets.
+- --mixup-alpha: mixup beta distribution alpha; set 0 to disable mixup.
+- --grad-clip: gradient clipping norm.
+- --no-augment: disable train-time augmentation.
+- --noise-std: augmentation noise level.
+- --time-shift: max augmentation time shift in samples.
+- --channel-dropout: augmentation channel dropout probability.
+- --continue-until-improves: continue after --epochs until validation accuracy improves, bounded by --max-epochs.
+- --patience: early stop after this many epochs without validation improvement.
+- --skip-scaling: skip the scaling-law experiment.
+
+Current Caveats
+
+- The split is trial-level, so validation/test performance can be optimistic compared with subject-independent evaluation.
+- The pipeline assumes downsampled data was created with ratio 4 from 512 Hz.
+- PSD folders and data cache folders are generated artifacts and are ignored by git.
