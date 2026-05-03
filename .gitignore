@@ -1,11 +1,11 @@
 # bci subject data cache
-raw/
 mne_data/
-pygedai_processed/
-downsampled/
-raw_psd/
-pygedai_processed_psd/
-downsampled_psd/
+raw/*
+pygedai_processed/*
+downsampled/*
+raw_psd/*
+pygedai_processed_psd/*
+downsampled_psd/*
 
 # Python caches
 __pycache__/
