@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 
 class EEGCacheDataset(Dataset):
-    def __init__(self, data_dir="processed_data", num_subjects=52, cache_subjects=1):
+    def __init__(self, data_dir="raw", num_subjects=52, cache_subjects=1):
         self.data_dir = Path(data_dir)
         cache_files = sorted(
             self.data_dir.glob("subject_*.pt"),
@@ -192,7 +192,7 @@ class EEGTransformer(nn.Module):
         return self.classifier(x[:, 0, :])
 
 
-def create_loaders(data_dir="processed_data", num_subjects=52, batch_size=32, seed=42, cache_subjects=1, num_workers=0):
+def create_loaders(data_dir="raw", num_subjects=52, batch_size=32, seed=42, cache_subjects=1, num_workers=0):
     full_dataset = EEGCacheDataset(data_dir=data_dir, num_subjects=num_subjects, cache_subjects=cache_subjects)
 
     train_size = int(0.7 * len(full_dataset))
@@ -399,7 +399,7 @@ def run_scaling_law(
 
 def main():
     parser = argparse.ArgumentParser(description="Train EEG transformer on cached MOABB data.")
-    parser.add_argument("--data-dir", default="processed_data")
+    parser.add_argument("--data-dir", default="raw")
     parser.add_argument("--num-subjects", type=int, default=52)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)

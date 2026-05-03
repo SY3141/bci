@@ -13,7 +13,7 @@ import urllib3
 from scipy.signal import resample_poly
 
 
-PROCESSED_DATA_DIR = "processed_data"
+RAW_DATA_DIR = "raw"
 PYGEDAI_DATA_DIR = "pygedai_processed"
 DOWNSAMPLED_DATA_DIR = "downsampled"
 MNE_DATA_DIR = "mne_data"
@@ -96,7 +96,7 @@ def configure_moabb(mne_data_dir=MNE_DATA_DIR):
     moabb.set_download_dir(str(mne_data_path))
 
 
-def get_cache_files(data_dir=PROCESSED_DATA_DIR):
+def get_cache_files(data_dir=RAW_DATA_DIR):
     return sorted(
         Path(data_dir).glob("subject_*.pt"),
         key=lambda path: int(path.stem.split("_")[-1]),
@@ -184,7 +184,7 @@ def _extract_original_subject_epochs(dataset, subject):
     return np.concatenate(X_runs, axis=0), np.asarray(y_runs)
 
 
-def download_subjects(data_dir=PROCESSED_DATA_DIR, mne_data_dir=MNE_DATA_DIR):
+def download_subjects(data_dir=RAW_DATA_DIR, mne_data_dir=MNE_DATA_DIR):
     configure_moabb(mne_data_dir=mne_data_dir)
     from moabb.datasets import Cho2017
 
@@ -221,7 +221,7 @@ def download_subjects(data_dir=PROCESSED_DATA_DIR, mne_data_dir=MNE_DATA_DIR):
     print("\nAll downloads complete or cached.")
 
 
-def inspect_subject(subject=1, data_dir=PROCESSED_DATA_DIR):
+def inspect_subject(subject=1, data_dir=RAW_DATA_DIR):
     sample_file = Path(data_dir) / f"subject_{subject}.pt"
     print(f"--- Inspecting {sample_file} ---")
     X_sub, y_sub = None, None
@@ -249,7 +249,7 @@ def inspect_subject(subject=1, data_dir=PROCESSED_DATA_DIR):
     free_cached_memory()
 
 
-def truncate_subjects(data_dir=PROCESSED_DATA_DIR, max_epochs=200):
+def truncate_subjects(data_dir=RAW_DATA_DIR, max_epochs=200):
     print(f"Checking subjects and filtering to {max_epochs} epochs...")
     for file_path in get_cache_files(data_dir):
         subject_num = int(file_path.stem.split("_")[-1])
@@ -393,11 +393,28 @@ def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.fl
 
 
 def apply_pygedai_preprocessing(
-    data_dir=PROCESSED_DATA_DIR,
+    data_dir=RAW_DATA_DIR,
     output_dir=PYGEDAI_DATA_DIR,
     sfreq=CHO2017_SFREQ,
     mne_data_dir=MNE_DATA_DIR,
 ):
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    subject_files = get_cache_files(data_dir)
+    pending_files = []
+    for file_path in subject_files:
+        subject_num = int(file_path.stem.split("_")[-1])
+        subject_output_path = output_path / file_path.name
+        if subject_output_path.exists():
+            print(f"Subject {subject_num}: Found {subject_output_path}. Skipping pygedai preprocessing.")
+            continue
+        pending_files.append(file_path)
+
+    if not pending_files:
+        print("All subjects already have pygedai_processed files. Skipping pygedai preprocessing.")
+        return
+
     run_gedai = _load_gedai()
     if run_gedai is None:
         print("Skipping pygedai preprocessing: could not import pygedai.gedai.")
@@ -412,12 +429,11 @@ def apply_pygedai_preprocessing(
         print(f"Skipping pygedai preprocessing: could not build Cho2017 reference covariance. e={exc}")
         return
 
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
     print("Applying pygedai preprocessing to subjects...")
-    for file_path in get_cache_files(data_dir):
+    for file_path in pending_files:
         subject_num = int(file_path.stem.split("_")[-1])
+        subject_output_path = output_path / file_path.name
+
         X_sub, y_sub, cleaned_subject, cleaned_data, epoch_data, out = None, None, None, None, None, None
         try:
             X_sub, y_sub = torch.load(file_path, weights_only=False)
@@ -456,10 +472,10 @@ def apply_pygedai_preprocessing(
                     if (epoch_idx + 1) % 10 == 0:
                         free_cached_memory()
 
-            torch.save((cleaned_subject, y_sub), output_path / file_path.name)
-            print(f"Subject {subject_num}: Pygedai preprocessing saved to {output_path / file_path.name}.")
+            torch.save((cleaned_subject, y_sub), subject_output_path)
+            print(f"Subject {subject_num}: Pygedai preprocessing saved to {subject_output_path}.")
         except Exception as exc:
-            print(f"Error applying pygedai to Subject {subject_num}: {exc}")
+            print(f"Error applying pygedai to Subject {subject_num}: {type(exc).__name__}: {exc!r}")
         finally:
             del X_sub, y_sub, cleaned_subject, cleaned_data, epoch_data, out
             free_cached_memory()
@@ -469,7 +485,7 @@ def apply_pygedai_preprocessing(
 
 
 def prepare_data(
-    data_dir=PROCESSED_DATA_DIR,
+    data_dir=RAW_DATA_DIR,
     mne_data_dir=MNE_DATA_DIR,
     downsampled_dir=DOWNSAMPLED_DATA_DIR,
     max_epochs=200,
@@ -490,7 +506,7 @@ def prepare_data(
 
 def main():
     parser = argparse.ArgumentParser(description="Download and prepare Cho2017 MOABB EEG data.")
-    parser.add_argument("--data-dir", default=PROCESSED_DATA_DIR)
+    parser.add_argument("--data-dir", default=RAW_DATA_DIR)
     parser.add_argument("--mne-data-dir", default=MNE_DATA_DIR)
     parser.add_argument("--downsampled-dir", default=DOWNSAMPLED_DATA_DIR)
     parser.add_argument("--max-epochs", type=int, default=200)

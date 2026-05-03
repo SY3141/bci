@@ -30,7 +30,7 @@ For each subject, MOABB returns:
 
 Each subject is saved as a PyTorch file:
 
-processed_data/subject_<id>.pt
+raw/subject_<id>.pt
 
 The saved file contains a tuple:
 
