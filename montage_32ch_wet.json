@@ -1,0 +1,62 @@
+{
+    "name": "32-Channel EEG Montage",
+    "description": "32-channel electrode configuration for OB6000",
+    "channels": {
+        "1": "Fp1",
+    "2": "F3",
+    "3": "F7",
+    "4": "FT9",
+    "5": "FC5",
+    "6": "FC1",
+    "7": "C3",
+    "8": "T7",
+    "9": "Fp2",
+    "10": "F4",
+    "11": "F8",
+    "12": "FT10",
+    "13": "FC6",
+    "14": "FC2",
+    "15": "C4",
+    "16": "T8",
+    "17": "Fz",
+    "18": "Pz",
+    "19": "TP9",
+    "20": "CP5",
+    "21": "Cz",
+    "22": "Oz",
+    "23": "TP10",
+    "24": "CP6",
+    "25": "CP1",
+    "26": "P3",
+    "27": "P7",
+    "28": "O1",
+    "29": "CP2",
+    "30": "P4",
+    "31": "P8",
+    "32": "O2"
+    },
+    "occipital_channels": ["O1", "O2"],
+    "impedance_thresholds": {
+        "description": "Impedance color coding thresholds in kΩ",
+        "good": {
+            "max_kohm": 5,
+            "color": "green",
+            "description": "Excellent contact - ≤150 kΩ"
+        },
+        "acceptable": {
+            "max_kohm": 10,
+            "color": "yellow", 
+            "description": "Acceptable contact - 150-400 kΩ"
+        },
+        "warning": {
+            "max_kohm": 50,
+            "color": "orange",
+            "description": "Poor contact - 400-800 kΩ"
+        },
+        "bad": {
+            "min_kohm": 100,
+            "color": "red",
+            "description": "Bad contact - >1200 kΩ"
+        }
+    }
+}

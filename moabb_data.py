@@ -383,7 +383,6 @@ def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.fl
         raise ValueError("No Cho2017 EEG channels could be matched to standard_1005 coordinates.")
 
     electrode_positions = pd.DataFrame(rows, columns=["channel_name", "X", "Y", "Z"])
-    print("Interpolating PyGEDAI reference covariance from Cho2017 standard_1005 channel coordinates...")
     reference_covariance = interpolate_ref_cov(electrode_positions, dtype=dtype)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

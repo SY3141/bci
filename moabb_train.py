@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 
 DEFAULT_DATA_DIR = "downsampled"
@@ -483,76 +483,6 @@ def train_model(
     if return_metrics:
         return model, metrics
     return model
-
-
-def run_scaling_law(
-    full_dataset,
-    train_dataset,
-    val_loader,
-    data_fractions=None,
-    epochs=100,
-    batch_size=32,
-    output_path="scaling_law.png",
-    lr=0.001,
-    weight_decay=1e-3,
-    label_smoothing=0.05,
-    mixup_alpha=0.2,
-    grad_clip=1.0,
-):
-    if data_fractions is None:
-        data_fractions = [0.125, 0.25, 0.5, 1.0]
-
-    val_accuracies = []
-
-    for frac in data_fractions:
-        print(f"Training on {frac * 100:g}% of the training data...")
-
-        num_samples = int(len(train_dataset) * frac)
-        train_subset = Subset(train_dataset, list(range(num_samples)))
-        subset_train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
-        checkpoint_path = Path(".dist") / f"scaling_law_{frac:g}.pt"
-
-        _, metrics = train_model(
-            full_dataset,
-            subset_train_loader,
-            val_loader,
-            test_loader=None,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            checkpoint_path=checkpoint_path,
-            label_smoothing=label_smoothing,
-            mixup_alpha=mixup_alpha,
-            grad_clip=grad_clip,
-            save_loss_plot=False,
-            return_metrics=True,
-        )
-
-        val_acc = metrics["best_val_acc"]
-        val_accuracies.append(val_acc)
-        print(
-            f"Best validation accuracy (evaluated on fixed 20% validation set) "
-            f"for {frac * 100:g}% train data: {val_acc:.2f}% "
-            f"at epoch {metrics['best_epoch']}\n"
-        )
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(
-        [frac * len(train_dataset) for frac in data_fractions],
-        val_accuracies,
-        marker="o",
-        linestyle="-",
-        color="b",
-        linewidth=2,
-        markersize=8,
-    )
-    plt.title("Scaling Law: Model Performance vs Dataset Size\n(Evaluated on the same fixed validation set)")
-    plt.xlabel("Number of Training Samples")
-    plt.ylabel("Validation Accuracy (%)")
-    plt.grid(True, linestyle="--", alpha=0.7)
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"Graph saved as {output_path}")
-    plt.close()
 
 
 def main():
