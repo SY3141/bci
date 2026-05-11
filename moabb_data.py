@@ -1,4 +1,5 @@
 import argparse
+import csv
 import gc
 import os
 import sys
@@ -17,6 +18,7 @@ RAW_DATA_DIR = "raw"
 PYGEDAI_DATA_DIR = "pygedai_processed"
 DOWNSAMPLED_DATA_DIR = "downsampled"
 MNE_DATA_DIR = "mne_data"
+CHANNEL_MAPPING_CSV = "64ch_to_32ch_mapping.csv"
 CHO2017_SFREQ = 512
 
 
@@ -109,12 +111,80 @@ def free_cached_memory():
         torch.cuda.empty_cache()
 
 
-def is_subject_cache_readable(file_path):
+def load_channel_mapping(mapping_csv=CHANNEL_MAPPING_CSV):
+    mapping_path = Path(mapping_csv)
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"Channel mapping CSV not found: {mapping_path}")
+
+    with mapping_path.open(newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+
+    required_columns = {"montage_32ch_row", "channel_name", "mapped_name"}
+    missing_columns = required_columns.difference(rows[0].keys() if rows else [])
+    if missing_columns:
+        raise ValueError(
+            f"{mapping_path} is missing required column(s): {sorted(missing_columns)}"
+        )
+
+    channel_mapping = []
+    for row in sorted(rows, key=lambda item: int(item["montage_32ch_row"])):
+        output_name = row["channel_name"].strip()
+        source_name = row["mapped_name"].strip()
+        if not output_name or not source_name:
+            raise ValueError(
+                f"{mapping_path} has a blank channel mapping at montage row "
+                f"{row.get('montage_32ch_row', '<unknown>')}."
+            )
+        channel_mapping.append(
+            {
+                "row": int(row["montage_32ch_row"]),
+                "output_name": output_name,
+                "source_name": source_name,
+            }
+        )
+
+    if not channel_mapping:
+        raise ValueError(f"{mapping_path} does not contain any channel mappings.")
+
+    return channel_mapping
+
+
+def resolve_mapped_channel_names(raw_ch_names, channel_mapping):
+    raw_lookup = {name.lower(): name for name in raw_ch_names}
+    selected_names = []
+    missing_names = []
+    for mapping in channel_mapping:
+        source_name = mapping["source_name"]
+        raw_name = raw_lookup.get(source_name.lower())
+        if raw_name is None:
+            missing_names.append(source_name)
+        else:
+            selected_names.append(raw_name)
+
+    if missing_names:
+        raise ValueError(
+            "Mapped source channel(s) not found in raw data: "
+            f"{missing_names}. Available EEG channels include: {raw_ch_names}"
+        )
+
+    if len(set(name.lower() for name in selected_names)) != len(selected_names):
+        raise ValueError(f"Channel mapping selects duplicate source channels: {selected_names}")
+
+    return selected_names
+
+
+def is_subject_cache_readable(file_path, expected_channels=None):
     X_sub, y_sub = None, None
     try:
         X_sub, y_sub = torch.load(file_path, weights_only=False)
         _ = X_sub.shape
         _ = len(y_sub)
+        if expected_channels is not None and X_sub.shape[1] != expected_channels:
+            print(
+                f"Cached file {file_path} has {X_sub.shape[1]} channels, expected "
+                f"{expected_channels}; it will be regenerated."
+            )
+            return False
         return True
     except Exception as exc:
         print(f"Cached file {file_path} is unreadable and will be redownloaded: {exc}")
@@ -139,7 +209,7 @@ def _event_label_lookup(event_id):
     return lookup
 
 
-def _extract_original_subject_epochs(dataset, subject):
+def _extract_original_subject_epochs(dataset, subject, channel_mapping):
     import mne
 
     subject_data = dataset.get_data(subjects=[subject])[subject]
@@ -175,7 +245,10 @@ def _extract_original_subject_epochs(dataset, subject):
                 verbose=False,
             )
 
-            X_runs.append(epochs.get_data())
+            selected_ch_names = resolve_mapped_channel_names(epochs.ch_names, channel_mapping)
+            name_to_index = {name.lower(): idx for idx, name in enumerate(epochs.ch_names)}
+            selected_indices = [name_to_index[name.lower()] for name in selected_ch_names]
+            X_runs.append(epochs.get_data()[:, selected_indices, :])
             y_runs.extend(label_lookup[int(code)] for code in epochs.events[:, 2])
 
     if not X_runs:
@@ -184,19 +257,27 @@ def _extract_original_subject_epochs(dataset, subject):
     return np.concatenate(X_runs, axis=0), np.asarray(y_runs)
 
 
-def download_subjects(data_dir=RAW_DATA_DIR, mne_data_dir=MNE_DATA_DIR):
+def download_subjects(
+    data_dir=RAW_DATA_DIR,
+    mne_data_dir=MNE_DATA_DIR,
+    channel_mapping_csv=CHANNEL_MAPPING_CSV,
+):
     configure_moabb(mne_data_dir=mne_data_dir)
     from moabb.datasets import Cho2017
 
     dataset = Cho2017()
+    channel_mapping = load_channel_mapping(channel_mapping_csv)
+    expected_channels = len(channel_mapping)
 
     Path(data_dir).mkdir(parents=True, exist_ok=True)
-    print("Checking and downloading missing subjects...")
+    print(
+        f"Checking and downloading missing subjects with {expected_channels} mapped EEG channels..."
+    )
 
     for subject in dataset.subject_list:
         file_path = Path(data_dir) / f"subject_{subject}.pt"
         if file_path.exists():
-            if is_subject_cache_readable(file_path):
+            if is_subject_cache_readable(file_path, expected_channels=expected_channels):
                 continue
             try:
                 file_path.unlink()
@@ -210,7 +291,11 @@ def download_subjects(data_dir=RAW_DATA_DIR, mne_data_dir=MNE_DATA_DIR):
         X_sub, y_sub = None, None
         try:
             dataset.data_path(subject)
-            X_sub, y_sub = _extract_original_subject_epochs(dataset, subject)
+            X_sub, y_sub = _extract_original_subject_epochs(
+                dataset,
+                subject,
+                channel_mapping=channel_mapping,
+            )
             torch.save((X_sub, y_sub), file_path)
         except Exception as exc:
             print(f"Skipping Subject {subject} due to download/processing error: {exc}")
@@ -340,7 +425,11 @@ def _load_interpolate_ref_cov():
             return None
 
 
-def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.float32):
+def build_cho2017_reference_covariance(
+    mne_data_dir=MNE_DATA_DIR,
+    dtype=torch.float32,
+    channel_mapping_csv=CHANNEL_MAPPING_CSV,
+):
     configure_moabb(mne_data_dir=mne_data_dir)
 
     import mne
@@ -359,6 +448,8 @@ def build_cho2017_reference_covariance(mne_data_dir=MNE_DATA_DIR, dtype=torch.fl
     raw = subject_data[session_key][run_key]
     eeg_picks = mne.pick_types(raw.info, eeg=True)
     ch_names = [raw.ch_names[i] for i in eeg_picks]
+    channel_mapping = load_channel_mapping(channel_mapping_csv)
+    ch_names = resolve_mapped_channel_names(ch_names, channel_mapping)
 
     montage = mne.channels.make_standard_montage("standard_1005")
     positions = montage.get_positions()["ch_pos"]
@@ -396,9 +487,11 @@ def apply_pygedai_preprocessing(
     output_dir=PYGEDAI_DATA_DIR,
     sfreq=CHO2017_SFREQ,
     mne_data_dir=MNE_DATA_DIR,
+    channel_mapping_csv=CHANNEL_MAPPING_CSV,
 ):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    expected_channels = len(load_channel_mapping(channel_mapping_csv))
 
     subject_files = get_cache_files(data_dir)
     pending_files = []
@@ -406,8 +499,14 @@ def apply_pygedai_preprocessing(
         subject_num = int(file_path.stem.split("_")[-1])
         subject_output_path = output_path / file_path.name
         if subject_output_path.exists():
-            print(f"Subject {subject_num}: Found {subject_output_path}. Skipping pygedai preprocessing.")
-            continue
+            if is_subject_cache_readable(subject_output_path, expected_channels=expected_channels):
+                print(f"Subject {subject_num}: Found {subject_output_path}. Skipping pygedai preprocessing.")
+                continue
+            try:
+                subject_output_path.unlink()
+            except OSError as exc:
+                print(f"Could not remove stale pygedai cache file {subject_output_path}: {exc}")
+                continue
         pending_files.append(file_path)
 
     if not pending_files:
@@ -423,6 +522,7 @@ def apply_pygedai_preprocessing(
         reference_covariance, device = build_cho2017_reference_covariance(
             mne_data_dir=mne_data_dir,
             dtype=torch.float32,
+            channel_mapping_csv=channel_mapping_csv,
         )
     except Exception as exc:
         print(f"Skipping pygedai preprocessing: could not build Cho2017 reference covariance. e={exc}")
@@ -490,11 +590,21 @@ def prepare_data(
     max_epochs=200,
     downsample_ratio=4,
     min_timepoints=400,
+    channel_mapping_csv=CHANNEL_MAPPING_CSV,
 ):
-    download_subjects(data_dir=data_dir, mne_data_dir=mne_data_dir)
+    download_subjects(
+        data_dir=data_dir,
+        mne_data_dir=mne_data_dir,
+        channel_mapping_csv=channel_mapping_csv,
+    )
     inspect_subject(subject=1, data_dir=data_dir)
     truncate_subjects(data_dir=data_dir, max_epochs=max_epochs)
-    apply_pygedai_preprocessing(data_dir=data_dir, output_dir=PYGEDAI_DATA_DIR, mne_data_dir=mne_data_dir)
+    apply_pygedai_preprocessing(
+        data_dir=data_dir,
+        output_dir=PYGEDAI_DATA_DIR,
+        mne_data_dir=mne_data_dir,
+        channel_mapping_csv=channel_mapping_csv,
+    )
     downsample_subjects(
         input_dir=PYGEDAI_DATA_DIR,
         output_dir=downsampled_dir,
@@ -511,6 +621,7 @@ def main():
     parser.add_argument("--max-epochs", type=int, default=200)
     parser.add_argument("--downsample-ratio", type=int, default=4)
     parser.add_argument("--min-timepoints", type=int, default=400)
+    parser.add_argument("--channel-mapping-csv", default=CHANNEL_MAPPING_CSV)
     args = parser.parse_args()
 
     prepare_data(
@@ -520,6 +631,7 @@ def main():
         max_epochs=args.max_epochs,
         downsample_ratio=args.downsample_ratio,
         min_timepoints=args.min_timepoints,
+        channel_mapping_csv=args.channel_mapping_csv,
     )
 
 

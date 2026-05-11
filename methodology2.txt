@@ -1,0 +1,953 @@
+Transformer and LoRA Methodology
+================================
+
+This document describes the EEG transformer architecture in moabb_train.py and
+the subject-specific LoRA fine-tuning procedure in lora.py.
+
+
+Input Data Format
+-----------------
+
+The training code reads cached subject tensors from:
+
+downsampled/subject_*.pt
+
+Each file stores:
+
+(X_sub, y_sub)
+
+X_sub is shaped as:
+
+(trials, channels, timepoints)
+
+After the 32-channel preprocessing path, the downsampled tensors are typically:
+
+(200, 32, 385)
+
+where:
+
+- 200 is the number of trials retained per subject.
+- 32 is the selected EEG channel count.
+- 385 is the downsampled time dimension after polyphase resampling.
+
+moabb_train.py concatenates selected subjects along the trial dimension and then
+adds a convolution input dimension:
+
+(trials, channels, timepoints)
+
+becomes:
+
+(trials, 1, channels, timepoints)
+
+The model therefore receives batches shaped as:
+
+(batch, 1, n_channels, n_timepoints)
+
+The architecture is not hard-coded to 32 or 64 channels. It reads:
+
+n_channels = self.X_tensor.shape[2]
+n_timepoints = self.X_tensor.shape[3]
+
+and constructs the model from those values.
+
+
+Normalization
+-------------
+
+Before training, every trial and every EEG channel is standardized independently
+over time:
+
+mean = X.mean(axis=-1, keepdims=True)
+std = X.std(axis=-1, keepdims=True)
+X = (X - mean) / max(std, 1e-7)
+
+This makes each channel in each trial approximately zero-mean and unit-variance.
+It reduces amplitude scale differences between subjects, channels, and trials.
+NaN values are replaced with finite numeric values using numpy.nan_to_num.
+
+
+Train, Validation, and Test Split
+---------------------------------
+
+moabb_train.py uses a stratified trial-level split:
+
+- 70% training
+- 20% validation
+- 10% testing
+
+The split is stratified by class label, so the class distribution is preserved
+across splits. The default seed is 42.
+
+This split is trial-level, not subject-level. Trials from the same subject can
+appear in train, validation, and test sets. This is useful for model development
+and debugging, but it is not a strict subject-independent evaluation.
+
+
+Training Augmentation
+---------------------
+
+Only the training subset receives augmentation. Validation and test data are not
+augmented.
+
+Default augmentations are:
+
+- Random temporal shift up to 16 samples.
+- Additive Gaussian noise with standard deviation 0.03.
+- Random channel dropout with probability 0.1.
+
+Temporal shift uses torch.roll along the time axis. Noise is added after
+normalization. Channel dropout samples a binary keep mask across the EEG channel
+axis and zeroes dropped channels for that training sample.
+
+
+EEGTransformer Overview
+-----------------------
+
+The model in moabb_train.py is named EEGTransformer. It combines EEG-specific
+convolutional feature extraction with a shallow transformer encoder.
+
+The high-level flow is:
+
+1. Multi-scale temporal convolution.
+2. Depthwise spatial filtering across all EEG channels.
+3. Separable temporal convolution and channel attention.
+4. Reshape into a sequence of temporal tokens.
+5. Add learned positional embeddings.
+6. Apply transformer encoder layers.
+7. Attention-pool the token sequence.
+8. Classify the pooled representation.
+
+This design gives the model local temporal filtering and electrode-spatial
+filtering before self-attention. That is useful for EEG because raw attention
+over every time sample would be expensive and weakly biased for the structure of
+the signal.
+
+
+Stage 1: Multi-Scale Temporal Front End
+---------------------------------------
+
+The input to the model is:
+
+(batch, 1, channels, timepoints)
+
+The first stage applies three parallel temporal convolution branches:
+
+kernel sizes = (15, 31, 63)
+temporal_filters = 8
+
+Each branch is:
+
+Conv2d(
+    in_channels=1,
+    out_channels=8,
+    kernel_size=(1, temporal_kernel_size),
+    padding=(0, temporal_kernel_size // 2),
+    bias=False,
+)
+BatchNorm2d(8)
+ELU()
+
+The convolution kernel height is 1, so this stage does not mix EEG channels yet.
+It filters along time only.
+
+The different kernel sizes let the model learn temporal patterns at multiple
+durations. Short kernels can detect sharper, faster changes. Longer kernels can
+capture slower rhythms or broader temporal context.
+
+The outputs of the three branches are concatenated along the feature-channel
+dimension:
+
+temporal_channels = temporal_filters * number_of_branches
+temporal_channels = 8 * 3 = 24
+
+After concatenation, the tensor is shaped approximately as:
+
+(batch, 24, channels, timepoints)
+
+
+Stage 2: Depthwise Spatial Filtering
+------------------------------------
+
+After temporal filtering, the model applies a spatial convolution whose kernel
+spans every EEG channel:
+
+Conv2d(
+    in_channels=24,
+    out_channels=48,
+    kernel_size=(n_channels, 1),
+    groups=24,
+    bias=False,
+)
+
+Because groups equals temporal_channels, this is a depthwise spatial
+convolution. Each temporal feature channel learns its own spatial filters across
+the electrodes. With the default spatial_depth of 2, each temporal channel
+produces two spatially filtered outputs:
+
+spatial_channels = temporal_channels * spatial_depth
+spatial_channels = 24 * 2 = 48
+
+For 32-channel data, the spatial kernel is:
+
+kernel_size = (32, 1)
+
+For 64-channel data, it would be:
+
+kernel_size = (64, 1)
+
+This is why the model can adapt automatically to the channel count present in
+the cached tensors.
+
+The spatial block is:
+
+Depthwise spatial Conv2d
+BatchNorm2d(48)
+ELU()
+AvgPool2d(kernel_size=(1, 4), stride=(1, 4))
+Dropout(0.4)
+
+After the spatial convolution, the channel-height dimension becomes 1 because
+the kernel spans all EEG channels.
+
+
+Stage 3: Separable Temporal Block
+---------------------------------
+
+The next stage is a separable temporal block. It further extracts temporal
+features while keeping the parameter count modest.
+
+The block is:
+
+Conv2d(
+    in_channels=48,
+    out_channels=48,
+    kernel_size=(1, 15),
+    padding=(0, 7),
+    groups=48,
+    bias=False,
+)
+Conv2d(
+    in_channels=48,
+    out_channels=d_model,
+    kernel_size=1,
+    bias=False,
+)
+BatchNorm2d(d_model)
+ELU()
+SqueezeExcite2d(d_model)
+AvgPool2d(kernel_size=(1, 4), stride=(1, 4))
+Dropout(0.4)
+
+The first convolution is depthwise over time: every feature channel is filtered
+separately with a temporal kernel of 15.
+
+The second convolution is a pointwise 1x1 convolution that mixes feature
+channels and projects them into the transformer embedding size:
+
+d_model = 64
+
+The squeeze-and-excitation block computes a learned gate for each d_model
+feature channel. It uses global average pooling, a small bottleneck MLP
+implemented with 1x1 convolutions, and a sigmoid gate. The result is multiplied
+back into the feature tensor, letting the network emphasize or suppress learned
+feature channels for each sample.
+
+
+Sequence Construction
+---------------------
+
+The CNN front end returns a tensor shaped like:
+
+(batch, d_model, 1, reduced_timepoints)
+
+The model removes the singleton spatial dimension and transposes the tensor into
+transformer format:
+
+(batch, sequence_length, d_model)
+
+In code:
+
+return x.squeeze(2).permute(0, 2, 1)
+
+The sequence length is determined dynamically by running a dummy input through
+the CNN feature extractor during model initialization:
+
+dummy_input = torch.zeros(1, 1, n_channels, n_timepoints)
+seq_len = self._extract_features(dummy_input).shape[1]
+
+This avoids hard-coding the post-pooling sequence length.
+
+
+Positional Embedding
+--------------------
+
+The transformer needs information about token order. The model uses a learned
+positional embedding:
+
+pos_embedding shape = (1, sequence_length, d_model)
+
+It is initialized from a small normal distribution:
+
+torch.randn(1, seq_len, d_model) * 0.02
+
+During forward, the positional embedding is added to the CNN token sequence.
+If an input has a different sequence length from the initialization sequence
+length, the positional embedding is linearly interpolated along the sequence
+axis before addition.
+
+
+Transformer Encoder
+-------------------
+
+The transformer encoder uses PyTorch's nn.TransformerEncoderLayer.
+
+Default settings:
+
+- d_model = 64
+- n_heads = 4
+- n_layers = 2
+- feedforward dimension = d_model * 4 = 256
+- activation = GELU
+- dropout = 0.4
+- batch_first = True
+
+Each encoder layer contains:
+
+- Multi-head self-attention.
+- Feedforward MLP.
+- Residual connections.
+- Layer normalization.
+- Dropout.
+
+Self-attention lets each temporal token attend to every other temporal token in
+the reduced sequence. This is the part of the model that can combine information
+across longer temporal ranges after the CNN has already extracted local EEG
+features.
+
+The transformer is intentionally shallow. EEG datasets are small compared with
+typical language or vision datasets, so a compact transformer is less likely to
+overfit and is faster to train.
+
+
+Attention Pooling
+-----------------
+
+The model does not use a CLS token. Instead, it learns attention weights over
+the output token sequence.
+
+The attention pooling module is:
+
+Linear(d_model, d_model // 2)
+Tanh()
+Linear(d_model // 2, 1)
+
+For each token, this produces one scalar score. A softmax over the sequence
+dimension converts those scores into attention weights:
+
+attention_weights = softmax(scores, dim=1)
+
+The final representation is a weighted sum:
+
+pooled = sum(tokens * attention_weights, dim=1)
+
+This allows the classifier to focus more strongly on the most informative
+temporal regions of each trial.
+
+
+Classifier
+----------
+
+The pooled representation is passed through:
+
+LayerNorm(d_model)
+Dropout(0.4)
+Linear(d_model, n_classes)
+
+For the Cho2017 left-hand vs right-hand setup, n_classes is usually 2.
+
+The model output is a logits tensor:
+
+(batch, n_classes)
+
+
+Base Training Objective
+-----------------------
+
+moabb_train.py uses AdamW:
+
+learning rate = 0.001
+weight decay = 1e-3
+
+The learning rate follows cosine annealing:
+
+CosineAnnealingLR(optimizer, T_max=epochs)
+
+The code computes class weights from the full dataset:
+
+class_weight[c] = total_samples / (num_classes * count[c])
+
+This compensates for class imbalance. The criterion object is a weighted
+CrossEntropyLoss with label smoothing, but the actual training loop uses a
+custom soft cross entropy so it can support mixup targets.
+
+Label smoothing defaults to:
+
+0.05
+
+Mixup defaults to:
+
+alpha = 0.2
+
+For each batch, labels are first converted to smoothed one-hot vectors. Mixup
+then forms convex combinations of pairs of inputs and pairs of soft targets.
+The loss is:
+
+soft_cross_entropy(logits, mixed_soft_targets, class_weights)
+
+Gradients are clipped by default:
+
+grad_clip = 1.0
+
+The best model is selected by validation accuracy and saved to:
+
+best_model.pt
+
+
+LoRA Fine-Tuning Overview
+-------------------------
+
+lora.py performs subject-specific fine-tuning from the pretrained base model.
+Instead of updating all model weights, it freezes the base model and inserts
+small trainable low-rank adapters into selected Linear layers.
+
+LoRA stands for low-rank adaptation. The idea is that a full weight update:
+
+Delta W
+
+can be approximated by the product of two much smaller matrices:
+
+Delta W = B @ A
+
+where:
+
+A shape = (rank, input_features)
+B shape = (output_features, rank)
+
+The effective layer becomes:
+
+y = base_linear(x) + scaling * B(A(dropout(x)))
+
+Only A and B are trained. The original base Linear weight and bias remain
+frozen.
+
+
+LoRA Architecture
+------------------------------------
+
+The LoRA architecture used here is an adapter architecture placed inside the
+pretrained EEGTransformer. It does not create a separate side model. Instead,
+selected nn.Linear modules are replaced in-place with LoRALinear modules.
+
+Each LoRALinear module contains three conceptual parts:
+
+1. The frozen pretrained Linear layer.
+2. A low-rank down-projection matrix A.
+3. A low-rank up-projection matrix B.
+
+For a base Linear layer with:
+
+input dimension = d_in
+output dimension = d_out
+
+the original trainable weight would have:
+
+d_out * d_in
+
+parameters, plus an optional bias.
+
+The LoRA update instead has:
+
+rank * d_in + d_out * rank
+
+trainable parameters.
+
+With the default rank:
+
+rank = 4
+
+the adapter parameter count is:
+
+4 * d_in + 4 * d_out
+
+This is much smaller than d_out * d_in for large Linear layers.
+
+The scaling factor is:
+
+scaling = alpha / rank
+scaling = 8.0 / 4 = 2.0
+
+The scaling factor controls the magnitude of the learned low-rank update before
+it is added to the frozen base output.
+
+The base path and LoRA path operate in parallel:
+
+base path:
+
+x -> frozen Linear -> base_output
+
+LoRA path:
+
+x -> dropout -> A projection -> B projection -> scale -> lora_output
+
+combined output:
+
+base_output + scaled_lora_output
+
+This means the subject-specific model begins as the original pretrained model
+and learns only an additive correction to selected Linear transformations.
+
+
+LoRA Matrix Shapes
+------------------
+
+For each wrapped Linear layer, lora.py creates:
+
+lora_A shape = (rank, in_features)
+lora_B shape = (out_features, rank)
+
+The intermediate LoRA representation has only rank features:
+
+x shape:              (..., in_features)
+after lora_A:         (..., rank)
+after lora_B:         (..., out_features)
+after scaling:        (..., out_features)
+base output shape:    (..., out_features)
+final output shape:   (..., out_features)
+
+The adapter therefore forms a low-dimensional bottleneck. For rank 4, every
+adapted Linear layer can change its mapping only through a 4-dimensional update
+space. That bottleneck is the main regularizing effect of LoRA.
+
+For the transformer feedforward layers in this model, the default dimensions are:
+
+d_model = 64
+feedforward dimension = 256
+
+The transformer feedforward Linear layers are:
+
+linear1: Linear(64, 256)
+linear2: Linear(256, 64)
+
+Their full weight sizes are:
+
+linear1 full weight: 256 * 64 = 16384 parameters
+linear2 full weight: 64 * 256 = 16384 parameters
+
+Their LoRA trainable parameter counts at rank 4 are:
+
+linear1 LoRA: 4 * 64 + 256 * 4 = 1280 parameters
+linear2 LoRA: 4 * 256 + 64 * 4 = 1280 parameters
+
+Because the transformer has 2 encoder layers, there are two linear1 modules and
+two linear2 modules. The feedforward LoRA adapters therefore add about:
+
+2 * 1280 + 2 * 1280 = 5120 trainable parameters
+
+for the transformer feedforward sublayers.
+
+The attention pooling module is:
+
+Linear(64, 32)
+Tanh()
+Linear(32, 1)
+
+At rank 4, the LoRA parameter counts are:
+
+Linear(64, 32): 4 * 64 + 32 * 4 = 384 parameters
+Linear(32, 1): 4 * 32 + 1 * 4 = 132 parameters
+
+The classifier contains:
+
+Linear(64, n_classes)
+
+For binary Cho2017 classification:
+
+n_classes = 2
+
+The classifier LoRA parameter count is:
+
+4 * 64 + 2 * 4 = 264 parameters
+
+So the default LoRA configuration adapts the model with only a small number of
+new parameters relative to the full EEGTransformer.
+
+
+Subject Dataset for LoRA
+------------------------
+
+For LoRA, each subject is loaded independently from:
+
+downsampled/subject_<id>.pt
+
+SubjectDataset applies the same per-trial, per-channel normalization used by
+the base training dataset:
+
+X = (X - mean_over_time) / std_over_time
+
+The subject tensor is reshaped to:
+
+(trials, 1, channels, timepoints)
+
+Labels are encoded with numpy.unique.
+
+Each subject is split with a stratified trial-level split:
+
+- 60% training
+- 20% validation
+- 20% testing
+
+The default batch size is 32 and the default seed is 42.
+
+
+Loading the Base Model
+----------------------
+
+For each subject, lora.py constructs an EEGTransformer using that subject's
+tensor shape:
+
+model = EEGTransformer(
+    n_channels=dataset.n_channels,
+    n_timepoints=dataset.n_timepoints,
+    n_classes=dataset.num_classes,
+)
+
+It then loads weights from:
+
+best_model.pt
+
+This means the base checkpoint must match the current channel count and time
+dimension. A checkpoint trained on 64-channel data will not load into a
+32-channel model because the spatial convolution shape is different.
+
+
+Freezing the Base Model
+-----------------------
+
+After loading the base checkpoint, lora.py freezes all parameters:
+
+for param in model.parameters():
+    param.requires_grad = False
+
+This prevents the pretrained temporal convolutions, spatial filters,
+transformer weights, and classifier weights from being directly modified during
+fine-tuning.
+
+
+LoRA Linear Layer Wrapper
+-------------------------
+
+LoRALinear wraps an existing nn.Linear layer.
+
+The stored base layer is:
+
+self.base = linear
+
+The LoRA parameters are:
+
+self.lora_A = Parameter(shape=(rank, linear.in_features))
+self.lora_B = Parameter(shape=(linear.out_features, rank))
+
+Default LoRA hyperparameters:
+
+- rank = 4
+- alpha = 8.0
+- scaling = alpha / rank = 2.0
+- dropout = 0.1
+
+lora_A is initialized with Kaiming uniform initialization.
+lora_B is initialized to zeros.
+
+Zero initialization of lora_B means the LoRA branch initially contributes
+approximately no change. At the start of fine-tuning, the wrapped layer behaves
+like the original base layer. Training then gradually learns a subject-specific
+low-rank update.
+
+The forward pass is:
+
+base_output = self.base(x)
+lora_output = linear(linear(dropout(x), lora_A), lora_B)
+output = base_output + lora_output * scaling
+
+The base layer parameters are frozen inside the wrapper.
+
+The wrapper also exposes weight and bias properties:
+
+weight -> self.base.weight
+bias -> self.base.bias
+
+This makes the wrapped layer behave more like a normal nn.Linear for code that
+expects those attributes. The actual trainable parameters, however, are only:
+
+lora_A
+lora_B
+
+The base layer's parameters have:
+
+requires_grad = False
+
+Because lora_B starts at zero, the initial LoRA update is zero even though
+lora_A is randomly initialized. This is intentional. It means replacing Linear
+layers with LoRA wrappers does not immediately change the pretrained model's
+predictions. The model begins fine-tuning from the exact base behavior and only
+changes as lora_B and lora_A are optimized.
+
+
+Which Layers Receive LoRA
+-------------------------
+
+lora.py replaces Linear layers whose module path contains one of these target
+keywords:
+
+LORA_TARGETS = (
+    "linear1",
+    "linear2",
+    "attention_pool",
+    "classifier",
+)
+
+This targets:
+
+- The transformer's feedforward MLP layers named linear1 and linear2.
+- The attention pooling Linear layers.
+- The final classifier Linear layer.
+
+In the default EEGTransformer, this means LoRA is inserted into:
+
+- transformer.layers.0.linear1
+- transformer.layers.0.linear2
+- transformer.layers.1.linear1
+- transformer.layers.1.linear2
+- attention_pool.0
+- attention_pool.2
+- classifier.2
+
+The exact module paths are discovered recursively by
+replace_linear_with_lora. A layer is wrapped if it is an nn.Linear and its path
+contains any target keyword. The replacement is done with setattr, so the model
+tree keeps the same structure except that selected Linear children become
+LoRALinear children.
+
+The implementation does not LoRA-wrap the convolutional front end. It also does
+not target the internal multi-head attention projection weights directly,
+because PyTorch's TransformerEncoderLayer stores much of that attention logic
+inside MultiheadAttention rather than as plain child nn.Linear modules with the
+targeted names.
+
+That design choice keeps LoRA focused on the model's higher-level decision and
+sequence-processing layers:
+
+- The convolutional front end remains a frozen generic EEG feature extractor.
+- The depthwise spatial filters remain fixed after base training.
+- The transformer feedforward blocks learn subject-specific token transforms.
+- Attention pooling learns subject-specific temporal weighting.
+- The classifier learns a subject-specific decision adjustment.
+
+The practical effect is that subject fine-tuning primarily adapts:
+
+- Transformer token processing through the feedforward sublayers.
+- Which temporal tokens are emphasized by attention pooling.
+- The final decision boundary.
+
+The low-level temporal and spatial EEG filters learned during base training
+remain frozen.
+
+
+Training Only LoRA Parameters
+-----------------------------
+
+lora.py collects trainable adapter parameters by name:
+
+lora_params = [
+    param
+    for name, param in model.named_parameters()
+    if "lora_" in name
+]
+
+The optimizer is AdamW:
+
+learning rate = 1e-3
+weight decay = 1e-4
+
+The loss is standard CrossEntropyLoss. Unlike base training, the LoRA loop does
+not use mixup, label smoothing, class weights, or augmentation.
+
+During LoRA training, the model is set to eval mode:
+
+model.eval()
+
+This keeps frozen BatchNorm and dropout behavior stable in the base model.
+However, LoRA dropout modules are explicitly put into train mode:
+
+for module in model.modules():
+    if isinstance(module, LoRALinear):
+        module.dropout.train()
+
+Thus only LoRA dropout remains active while the frozen base network behaves as
+an evaluation-time feature extractor/classifier.
+
+For each epoch:
+
+1. Run the model on subject-specific training batches.
+2. Compute cross entropy.
+3. Backpropagate into LoRA parameters only.
+4. Update LoRA parameters with AdamW.
+5. Evaluate validation accuracy.
+6. Keep the best state dict by validation accuracy.
+
+The default LoRA training duration is:
+
+20 epochs
+
+Because the base network is frozen, backpropagation still computes gradients
+through the full model graph, but only LoRA parameters receive gradient updates.
+Frozen parameters either have no gradients or gradients that are not used by the
+optimizer.
+
+The optimizer parameter list is constructed only from names containing:
+
+"lora_"
+
+This avoids accidentally updating base model weights even though the forward
+pass still uses them.
+
+The LoRA training loop also keeps the main model in eval mode. This matters
+because the pretrained EEGTransformer contains BatchNorm and Dropout. Eval mode
+keeps BatchNorm statistics fixed and disables ordinary dropout in the frozen
+base model. The only dropout deliberately kept active is the dropout inside each
+LoRALinear adapter.
+
+This produces a stable base representation while still regularizing the small
+subject-specific adapter path.
+
+
+Merging LoRA into the Base Weights
+----------------------------------
+
+After subject-specific fine-tuning, lora.py merges every LoRA-wrapped Linear
+layer back into a normal nn.Linear layer.
+
+For a wrapped layer, the learned update is:
+
+delta_weight = (lora_B @ lora_A) * scaling
+
+The merged weight is:
+
+merged_weight = base_weight + delta_weight
+
+The base bias is copied unchanged.
+
+After merging, the model no longer contains LoRALinear modules. It is a normal
+EEGTransformer with subject-specific Linear weights. This makes inference and
+benchmarking simpler because the saved model can be loaded directly into the
+standard EEGTransformer architecture.
+
+Merging is mathematically equivalent to keeping the LoRA branch during
+inference, as long as LoRA dropout is disabled. During evaluation, dropout is
+inactive, so:
+
+base_linear(x) + scaling * B(A(x))
+
+is equivalent to:
+
+linear(x, base_weight + scaling * B @ A, base_bias)
+
+The merge step creates a fresh nn.Linear layer with the same input dimension,
+output dimension, device, dtype, and bias setting as the base layer. It copies
+the merged weight into that layer and copies the original bias unchanged.
+
+After all LoRALinear modules are merged, the state dict no longer has lora_A or
+lora_B parameters. That is why lora_benchmark.py can instantiate a normal
+EEGTransformer and load the fine-tuned subject state dict directly.
+
+
+Saved Fine-Tuned Models
+-----------------------
+
+After merging, lora.py evaluates:
+
+- merged validation accuracy
+- merged test accuracy
+
+Then it saves the subject-specific model to:
+
+finetune/subject_<id>_model.pt
+
+Each saved file contains the merged model state dict. It is not just the LoRA
+adapter weights.
+
+
+LoRA Benchmarking
+-----------------
+
+lora_benchmark.py evaluates saved subject-specific models.
+
+For each file:
+
+finetune/subject_<id>_model.pt
+
+it:
+
+1. Loads the matching subject dataset from downsampled.
+2. Recreates the same 60/20/20 stratified split.
+3. Builds an EEGTransformer with the subject tensor shape.
+4. Loads the merged fine-tuned state dict.
+5. Evaluates test accuracy on the held-out subject test split.
+6. Writes results to lora_benchmark.csv.
+
+The benchmark CSV includes:
+
+- subject
+- model_path
+- file_path
+- total_samples
+- train_samples
+- validation_samples
+- test_samples
+- classes
+- test_accuracy
+
+
+Why LoRA is Useful Here
+-----------------------
+
+EEG varies strongly across subjects. A model trained across all subjects can
+learn useful generic temporal and spatial features, but each subject may have
+different electrode contact quality, anatomy, signal amplitude, noise, and
+motor-imagery patterns.
+
+Full fine-tuning all parameters per subject can overfit quickly because each
+subject has only about 200 trials. LoRA reduces the number of trainable
+parameters by representing each Linear-layer update as a low-rank matrix
+product. This makes subject adaptation lighter and less likely to destroy the
+base model's learned EEG features.
+
+The implementation uses the base model as a frozen feature extractor plus
+sequence model, then learns small subject-specific changes in the transformer
+MLP, attention pooling, and classifier layers.
+
+
+Important Compatibility Notes
+-----------------------------
+
+The base checkpoint and LoRA fine-tuning data must have matching tensor shapes.
+In particular:
+
+- A 64-channel base checkpoint should be fine-tuned on 64-channel data.
+- A 32-channel base checkpoint should be fine-tuned on 32-channel data.
+
+If the channel count changes, the depthwise spatial convolution weight shape
+changes, so the checkpoint will not load.
+
+The channel order also matters. For 32-channel data, the order comes from
+64ch_to_32ch_mapping.csv and must stay consistent through preprocessing,
+training, fine-tuning, and interpretation.
